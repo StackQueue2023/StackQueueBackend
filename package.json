@@ -1,0 +1,30 @@
+{
+  "name": "stackqueue-server",
+  "version": "1.0.0",
+  "description": "STACK QUEUE — Inclusive Learning Platform Backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node daemon.js",
+    "start:daemon": "node daemon.js",
+    "start:direct": "node server.js",
+    "start:pm2": "pm2 start ecosystem.config.js",
+    "stop:pm2": "pm2 stop ecosystem.config.js",
+    "restart:pm2": "pm2 restart ecosystem.config.js",
+    "dev": "node --watch server.js",
+    "seed": "node services/seedRunner.js"
+  },
+  "dependencies": {
+    "archiver": "^8.0.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.9.5",
+    "morgan": "^1.10.0",
+    "multer": "^2.4.0",
+    "nodemailer": "^10.0.11",
+    "pdf-parse": "^2.4.5",
+    "pdfkit": "^0.20.2"
+  }
+}
