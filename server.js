@@ -1,7 +1,9 @@
 const path = require('path');
 const fs = require('fs');
-const envPath = fs.existsSync(path.join(__dirname, '.env')) ? path.join(__dirname, '.env') : path.join(__dirname, '..', '.env');
-require('dotenv').config({ path: envPath });
+if (!process.env.VERCEL) {
+  const envPath = fs.existsSync(path.join(__dirname, '.env')) ? path.join(__dirname, '.env') : path.join(__dirname, '..', '.env');
+  require('dotenv').config({ path: envPath });
+}
 const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
@@ -53,13 +55,15 @@ process.on('uncaughtException', async (err) => {
 });
 
 // Connect to MongoDB
-connectDB();
+if (!process.env.VERCEL || process.env.MONGODB_URI) {
+  connectDB();
+}
 
 const app = express();
 
 // Ensure Database Connection in Serverless / Cold-Start Environments
 app.use(async (req, res, next) => {
-  if (mongoose.connection.readyState !== 1) {
+  if (process.env.MONGODB_URI && mongoose.connection.readyState !== 1) {
     try {
       await connectDB();
     } catch (_) {}
@@ -101,10 +105,14 @@ app.use((req, res, next) => {
 
 // Root endpoint to verify server status from browser / Vercel
 app.get('/', (req, res) => {
+  const isVercel = !!process.env.VERCEL;
+  const hasDbUri = !!process.env.MONGODB_URI;
   res.status(200).json({
     success: true,
     message: 'STACK QUEUE Backend API is running successfully.',
-    status: 'live',
+    environment: isVercel ? 'Vercel Serverless' : (process.env.NODE_ENV || 'development'),
+    databaseConfigured: hasDbUri,
+    databaseStatus: mongoose.connection.readyState === 1 ? 'connected' : (hasDbUri ? 'connecting' : 'MONGODB_URI missing in Environment Variables'),
     timestamp: new Date().toISOString(),
     endpoints: {
       health: '/api/health',
@@ -130,13 +138,15 @@ app.get('/api/health', (req, res) => {
     2: 'connecting',
     3: 'disconnecting'
   };
-  const dbState = dbStates[mongoose.connection.readyState] || 'unknown';
+  const hasDbUri = !!process.env.MONGODB_URI;
+  const dbState = hasDbUri ? (dbStates[mongoose.connection.readyState] || 'unknown') : 'MONGODB_URI not set in Vercel';
   const isHealthy = mongoose.connection.readyState === 1;
 
-  res.status(isHealthy ? 200 : 503).json({
-    status: isHealthy ? 'healthy' : 'degraded',
+  res.status(isHealthy || !process.env.VERCEL ? (isHealthy ? 200 : 503) : 200).json({
+    status: isHealthy ? 'healthy' : (hasDbUri ? 'degraded' : 'setup_required'),
     platform: 'STACK QUEUE Institute API',
     database: dbState,
+    notice: hasDbUri ? undefined : 'Please add MONGODB_URI to your Vercel Project Settings -> Environment Variables',
     timestamp: new Date().toISOString(),
     version: '1.0.0'
   });
@@ -225,11 +235,17 @@ app.use('/api/college-financial', require('./routes/collegeFinancialRoutes'));
 app.use('/api/adaptive-questions', require('./routes/adaptiveQuestionRoutes'));
 app.use('/api', require('./routes/collegeTrainingSyllabusRoutes'));
 
-// Start schedulers
-initBatchScheduler();
-initLiveClassReminderScheduler();
-initFeeReminderScheduler();
-initTrainingReportScheduler();
+// Start schedulers (Only in persistent server / local daemon environments, never in serverless functions)
+if (!process.env.VERCEL) {
+  try {
+    initBatchScheduler();
+    initLiveClassReminderScheduler();
+    initFeeReminderScheduler();
+    initTrainingReportScheduler();
+  } catch (schedErr) {
+    systemLogger.warn(`[Schedulers Init Warning]: ${schedErr.message}`);
+  }
+}
 
 // 404 handler
 app.use((req, res) => {
