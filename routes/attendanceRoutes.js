@@ -3,6 +3,7 @@ const router = express.Router();
 const attendanceController = require('../controllers/attendanceController');
 const { protect } = require('../middleware/auth');
 const { authorize } = require('../middleware/rbac');
+const { requireRegularStudent } = require('../middleware/studentCategoryGuard');
 
 // Tutor & Admin endpoints
 router.get('/tutor-students', protect, authorize('trainer', 'admin', 'tutor'), attendanceController.getTutorStudentsAttendance);
@@ -14,9 +15,9 @@ router.post('/leave-requests/:id/reject', protect, authorize('trainer', 'admin',
 router.get('/tutor-self', protect, authorize('trainer', 'admin', 'tutor'), attendanceController.getTutorSelfAttendance);
 router.post('/tutor-self', protect, authorize('trainer', 'admin', 'tutor'), attendanceController.markTutorSelfAttendance);
 
-// Student endpoints
-router.post('/student-leave', protect, authorize('student'), attendanceController.submitStudentLeave);
-router.get('/my-leaves', protect, authorize('student'), attendanceController.getStudentLeaves);
+// Student endpoints (Leave Management restricted to Regular Students; Attendance remains accessible)
+router.post('/student-leave', protect, authorize('student'), requireRegularStudent, attendanceController.submitStudentLeave);
+router.get('/my-leaves', protect, authorize('student'), requireRegularStudent, attendanceController.getStudentLeaves);
 router.get('/my-attendance', protect, authorize('student'), attendanceController.getStudentOwnAttendance);
 
 // Backward compatibility fallback endpoint

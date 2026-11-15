@@ -101,6 +101,11 @@ const interviewQuestionSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  topicId: {
+    type: String,
+    default: '',
+    index: true
+  },
   technology: {
     type: String,
     default: '',
@@ -126,13 +131,13 @@ const interviewQuestionSchema = new mongoose.Schema({
   }],
   targetFeature: {
     type: String,
-    enum: ['INTERVIEW_ARENA', 'MOCK_INTERVIEW', 'MODULE_QUESTIONS', 'MODULE', 'TESTING_PRACTICE', 'GENERAL'],
+    enum: ['INTERVIEW_ARENA', 'MOCK_INTERVIEW', 'MODULE_QUESTIONS', 'MODULE', 'TESTING_PRACTICE', 'DAILY_CHALLENGE', 'GENERAL'],
     default: 'INTERVIEW_ARENA',
     index: true
   },
   questionBankType: {
     type: String,
-    enum: ['INTERVIEW_ARENA', 'MOCK_INTERVIEW', 'MODULE'],
+    enum: ['INTERVIEW_ARENA', 'MOCK_INTERVIEW', 'MODULE', 'DAILY_CHALLENGE'],
     default: 'INTERVIEW_ARENA',
     index: true
   },
@@ -154,6 +159,27 @@ const interviewQuestionSchema = new mongoose.Schema({
     default: 'coding',
     index: true
   },
+  options: [{
+    optionId: {
+      type: String,
+      enum: ['A', 'B', 'C', 'D'],
+      required: true
+    },
+    text: {
+      type: String,
+      required: true
+    }
+  }],
+  correctAnswer: {
+    type: String,
+    enum: ['A', 'B', 'C', 'D'],
+    default: null
+  },
+  points: {
+    type: Number,
+    default: 10,
+    min: 1
+  },
   theoryAnswer: {
     type: String,
     default: ''
@@ -164,6 +190,78 @@ const interviewQuestionSchema = new mongoose.Schema({
     default: 'verified',
     index: true
   },
+  flagReason: {
+    type: String,
+    default: ''
+  },
+  flaggedAt: {
+    type: Date,
+    default: null
+  },
+  recoveredAt: {
+    type: Date,
+    default: null
+  },
+  lastValidatedAt: {
+    type: Date,
+    default: null
+  },
+  compilerError: {
+    type: String,
+    default: null
+  },
+  failedTestCases: [{
+    input: { type: String, default: '' },
+    expectedOutput: { type: String, default: '' },
+    actualOutput: { type: String, default: '' },
+    error: { type: String, default: '' }
+  }],
+  manualReviewStatus: {
+    type: String,
+    enum: ['NONE', 'OVERRIDDEN', 'APPROVED', 'REJECTED'],
+    default: 'NONE'
+  },
+  updatedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
+  auditHistory: [{
+    action: {
+      type: String,
+      enum: ['EDIT', 'DELETE', 'FLAG', 'RECOVER', 'REVALIDATE', 'ADMIN_OVERRIDE'],
+      required: true
+    },
+    performedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    },
+    performedByName: {
+      type: String,
+      default: 'Admin'
+    },
+    timestamp: {
+      type: Date,
+      default: Date.now
+    },
+    reason: {
+      type: String,
+      default: ''
+    },
+    previousStatus: {
+      type: String,
+      default: ''
+    },
+    newStatus: {
+      type: String,
+      default: ''
+    },
+    details: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {}
+    }
+  }],
   referenceSolution: {
     type: String,
     default: ''

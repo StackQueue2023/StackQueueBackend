@@ -22,9 +22,11 @@ async function checkAndSendFeeReminders() {
     const now = new Date();
     const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
-    // 1. Fetch all active student profiles that have an enrolled course
+    // 1. Fetch strictly LMS course student profiles (completely exclude College Training students)
     const studentProfiles = await StudentProfile.find({
-      enrolledCourseId: { $ne: null }
+      studentType: 'LMS',
+      enrolledCourseId: { $ne: null },
+      collegeId: null
     }).populate('userId').populate('enrolledCourseId');
 
     const results = {
@@ -38,6 +40,9 @@ async function checkAndSendFeeReminders() {
       const user = profile.userId;
       const course = profile.enrolledCourseId;
       if (!user || user.role !== 'student' || user.isActive === false) continue;
+      // Strictly exclude college training students
+      if (profile.studentType !== 'LMS' || profile.collegeId) continue;
+      if (user.studentCategory === 'TRAINING_TEMPORARY' || user.studentType === 'TRAINING_TEMPORARY' || user.studentType === 'COLLEGE_TRAINING') continue;
       if (!course) continue;
 
       results.processedStudents++;

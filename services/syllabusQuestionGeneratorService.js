@@ -5,12 +5,17 @@ const DomainTask = require('../models/DomainTask');
 const InterviewQuestion = require('../models/InterviewQuestion');
 const InterviewTestCase = require('../models/InterviewTestCase');
 const Challenge = require('../models/Challenge');
-const Game = require('../models/Game');
 const QuestionRegistry = require('../models/QuestionRegistry');
 const SyllabusGenerationJob = require('../models/SyllabusGenerationJob');
+const InterviewSubmission = require('../models/InterviewSubmission');
+const StudentDomainProgress = require('../models/StudentDomainProgress');
 const { generateFingerprint, normalizeQuestionText } = require('./questionRegistryService');
 const { evaluateCode } = require('./interviewCodeRunner');
 const { generateQuestionSpec } = require('./questionSpecificationEngine');
+const { analyzeModuleScope, buildTopicId, computeModuleSignature } = require('./moduleScopeEngine');
+const { allocateQuestionNumbers } = require('./questionNumberAllocator');
+const { validateGeneratedQuestion } = require('./questionValidationService');
+const { extractCourseSyllabusTopics } = require('./syllabusTopicExtractorService');
 const {
   detectTechnology,
   detectIntegrationChallenge,
@@ -50,87 +55,35 @@ function getLanguageForDomain(domainKey) {
 }
 
 /**
- * Ensures a corresponding Game exists in Game Hub for the domain
- */
-async function ensureDomainGame(domainKey, courseTitle) {
-  const existingGame = await Game.findOne({
-    $or: [
-      { slug: `${domainKey}-quest` },
-      { slug: domainKey },
-      { category: { $regex: new RegExp(domainKey, 'i') } }
-    ]
-  });
-
-  if (existingGame) return existingGame;
-
-  const colorMap = {
-    java: { primary: '#ea580c', accent: '#f97316', gradient: 'from-orange-500 to-amber-600' },
-    python: { primary: '#0284c7', accent: '#38bdf8', gradient: 'from-sky-500 to-blue-600' },
-    cpp: { primary: '#7c3aed', accent: '#a855f7', gradient: 'from-purple-600 to-indigo-600' },
-    react: { primary: '#0d9488', accent: '#14b8a6', gradient: 'from-teal-500 to-emerald-600' }
-  };
-
-  const theme = colorMap[domainKey] || {
-    primary: '#4f46e5',
-    accent: '#818cf8',
-    gradient: 'from-indigo-600 to-purple-600'
-  };
-
-  return await Game.create({
-    title: `${courseTitle || domainKey.toUpperCase()} Mastery Quest`,
-    slug: `${domainKey}-quest`,
-    tagline: `Interactive challenges & coding puzzles for ${courseTitle || domainKey}`,
-    description: `Master core and advanced concepts of ${courseTitle || domainKey} through interactive arenas, quizzes, and code challenges.`,
-    category: 'Full Stack',
-    difficulty: 'All Levels',
-    icon: 'Terminal',
-    themeColor: theme,
-    totalLevels: 100,
-    order: 10,
-    isActive: true
-  });
-}
-
-/**
  * Global synchronized Question Number Sequence Generator (Atomic & Concurrency-Safe)
  */
-let globalQSequencePromise = null;
-let currentQNumberCounter = 0;
-
 async function getNextQNumberBatch(count) {
-  if (!globalQSequencePromise) {
-    globalQSequencePromise = (async () => {
-      const lastQ = await InterviewQuestion.findOne().sort({ questionNumber: -1 }).select('questionNumber').lean();
-      currentQNumberCounter = (lastQ?.questionNumber || 1000);
-      return currentQNumberCounter;
-    })();
-  }
-  await globalQSequencePromise;
-  const start = currentQNumberCounter + 1;
-  currentQNumberCounter += count;
-  return start;
+  return allocateQuestionNumbers(count);
 }
 
 /**
- * Helper to build valid code templates and test cases matching syllabus domain
- * Completely free of synthetic templates (alpha -> ALPHA)
+ * Helper to build valid, strictly module-scoped code templates and test cases.
  */
-function buildQuestionContentForTopic(topic, moduleTitle, courseTitle, domainKey, index, difficulty) {
+function buildQuestionContentForTopic(topic, moduleTitle, courseTitle, domainKey, index, difficulty, scope = null) {
   const detectedTech = detectTechnology({ topic, moduleTitle, courseTitle, domainKey });
   const integrationInfo = detectIntegrationChallenge(topic, moduleTitle, domainKey);
 
-  const effectiveTechnology = integrationInfo.isIntegration ? integrationInfo.technology : detectedTech.name;
-  const effectiveLang = detectedTech.language || getLanguageForDomain(domainKey);
-  const effectiveCompiler = detectedTech.compiler;
+  const effectiveTechnology = scope?.technology || (integrationInfo.isIntegration ? integrationInfo.technology : detectedTech.name);
+  const effectiveLang = scope?.language || detectedTech.language || getLanguageForDomain(domainKey);
+  const effectiveCompiler = scope?.compiler || detectedTech.compiler;
   const effectiveEvaluationMethod = detectedTech.evaluationMethod || 'coding';
 
   const spec = generateQuestionSpec({
     title: `${topic} (${difficulty || 'Easy'})`,
     topic,
     moduleTitle,
+    moduleDescription: scope?.moduleDescription || '',
+    moduleTopics: scope?.topics || [],
+    primaryCategories: scope?.primaryCategories || [],
     courseTitle,
     domain: domainKey,
     taskIndex: (index || 0) + 1,
+    variationIndex: index || 0,
     difficulty: difficulty || 'Easy'
   });
 
@@ -138,8 +91,8 @@ function buildQuestionContentForTopic(topic, moduleTitle, courseTitle, domainKey
     ? spec.starterCode
     : getStarterCodeForTechnology(effectiveTechnology, effectiveLang, topic);
 
-  const visibleTestCases = spec.testCases.slice(0, 2);
-  const hiddenTestCases = spec.testCases.slice(2);
+  const visibleTestCases = spec.testCases.filter(tc => !tc.isHidden);
+  const hiddenTestCases = spec.testCases.filter(tc => tc.isHidden);
 
   return {
     lang: effectiveLang,
@@ -148,6 +101,9 @@ function buildQuestionContentForTopic(topic, moduleTitle, courseTitle, domainKey
     compilerId: detectedTech.compilerId,
     evaluationMethod: effectiveEvaluationMethod,
     category: detectedTech.category,
+    categoryKey: spec.categoryKey,
+    questionType: spec.questionType || 'coding',
+    titleSuffix: spec.titleSuffix,
     isIntegration: integrationInfo.isIntegration,
     description: spec.problemStatement.split('\n\n')[1] || spec.problemStatement,
     starterCode: { [effectiveLang]: starterCodeStr },
@@ -165,9 +121,77 @@ function buildQuestionContentForTopic(topic, moduleTitle, courseTitle, domainKey
       { input: spec.sampleInput, output: spec.sampleOutput, explanation: spec.explanation },
       { input: spec.sampleInput2, output: spec.sampleOutput2, explanation: spec.testCases[1]?.explanation || 'Secondary execution branch.' }
     ],
-    visibleTestCases,
-    hiddenTestCases,
+    visibleTestCases: visibleTestCases.length > 0 ? visibleTestCases : spec.testCases.slice(0, 2),
+    hiddenTestCases: hiddenTestCases.length > 0 ? hiddenTestCases : spec.testCases.slice(2),
     testCases: spec.testCases
+  };
+}
+
+/**
+ * Generates and strictly validates a question candidate against all 5 module-scope rules.
+ * Rejects & retries with next variation if any rule fails.
+ */
+async function buildValidatedContentForTopic({
+  topic,
+  mod,
+  scope,
+  courseTitle,
+  domainKey,
+  baseIndex = 0,
+  difficulty = 'Easy',
+  runSandbox = true,
+  existingFingerprints = null
+}) {
+  const maxAttempts = 6;
+  let lastReason = '';
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const content = buildQuestionContentForTopic(
+      topic,
+      mod.title,
+      courseTitle,
+      domainKey,
+      baseIndex + attempt,
+      difficulty,
+      scope
+    );
+
+    const candidateTitle = `${topic} — ${content.titleSuffix}`;
+    const candidate = {
+      title: candidateTitle,
+      categoryKey: content.categoryKey,
+      problemStatement: content.description,
+      inputFormat: content.inputFormat,
+      outputFormat: content.outputFormat,
+      referenceSolution: content.referenceSolution,
+      testCases: content.testCases,
+      fingerprint: generateFingerprint(candidateTitle, content.description, mod.title, domainKey)
+    };
+
+    const validation = await validateGeneratedQuestion({
+      question: candidate,
+      scope,
+      runSandbox,
+      existingFingerprints
+    });
+
+    if (validation.valid) {
+      if (existingFingerprints && candidate.fingerprint) {
+        existingFingerprints.add(candidate.fingerprint);
+      }
+      return { content, validation, rejectedReasons: [] };
+    }
+
+    lastReason = validation.reason;
+    console.warn(`[QuestionValidator] REJECTED attempt ${attempt + 1} for Module ${mod.order} (${mod.title}) / "${topic}": ${lastReason}`);
+  }
+
+  // Return last attempt marked flagged if all retries failed
+  const fallbackContent = buildQuestionContentForTopic(topic, mod.title, courseTitle, domainKey, baseIndex, difficulty, scope);
+  return {
+    content: fallbackContent,
+    validation: { valid: false, reason: lastReason },
+    rejectedReasons: [lastReason]
   };
 }
 
@@ -176,7 +200,7 @@ function buildQuestionContentForTopic(topic, moduleTitle, courseTitle, domainKey
  * PILLAR 1: INTERVIEW ARENA GENERATION (Batch Oriented)
  * ──────────────────────────────────────────────────────────────
  */
-async function generateInterviewArenaBatch({ course, mod, topics, domainKey, questionsPerTopic = 2 }) {
+async function generateInterviewArenaBatch({ course, mod, topics, domainKey, scope, questionsPerTopic = 2 }) {
   const count = topics.length * questionsPerTopic;
   if (count === 0) return { questions: [], testCases: [], registryDocs: [] };
 
@@ -184,13 +208,7 @@ async function generateInterviewArenaBatch({ course, mod, topics, domainKey, que
   let currentNum = startNumber;
 
   const difficulties = ['Easy', 'Medium', 'Hard'];
-  const questionTypes = [
-    { typeName: 'Technical Interview', prefix: 'Technical Deep-Dive' },
-    { typeName: 'Conceptual', prefix: 'Architectural Analysis' },
-    { typeName: 'Scenario-Based', prefix: 'Production Scenario' },
-    { typeName: 'Coding Challenge', prefix: 'Algorithm Implementation' },
-    { typeName: 'Output Prediction', prefix: 'State & Output Evaluation' }
-  ];
+  const existingFingerprints = new Set();
 
   const questionDocs = [];
   const allTestCases = [];
@@ -198,30 +216,42 @@ async function generateInterviewArenaBatch({ course, mod, topics, domainKey, que
 
   for (let tIdx = 0; tIdx < topics.length; tIdx++) {
     const topic = topics[tIdx];
+    const topicId = buildTopicId(mod._id, topic, tIdx);
 
     for (let qIdx = 0; qIdx < questionsPerTopic; qIdx++) {
       const qNum = currentNum++;
       const diff = difficulties[(tIdx + qIdx) % difficulties.length];
-      const qType = questionTypes[(tIdx + qIdx) % questionTypes.length];
-      const title = `${qType.prefix}: ${topic} in ${course.title} (${diff})`;
 
-      const content = buildQuestionContentForTopic(topic, mod.title, course.title, domainKey, qIdx, diff);
+      const { content, validation } = await buildValidatedContentForTopic({
+        topic,
+        mod,
+        scope,
+        courseTitle: course.title,
+        domainKey,
+        baseIndex: tIdx + qIdx,
+        difficulty: diff,
+        runSandbox: true,
+        existingFingerprints
+      });
+
+      const title = `${topic}: ${content.titleSuffix} (${diff})`;
 
       const problemStatement = `### Problem Context\n` +
         `This problem evaluates **${topic}** in **${course.title}** (${mod.title}).\n\n` +
         `**Objective**:\n` +
         `${content.description}\n\n` +
-        `**Key Focus Area**:\n` +
+        `**Syllabus Alignment**:\n` +
         `- Domain: ${course.title}\n` +
         `- Module: ${mod.title}\n` +
-        `- Concept: ${topic}\n` +
-        `- Difficulty: ${diff}\n` +
-        `- Category: ${qType.typeName}`;
+        `- Topic: ${topic}\n` +
+        `- Difficulty: ${diff}`;
 
-      const explanation = `### Detailed Technical Explanation: ${topic}\n` +
-        `1. **Theoretical Foundation**: ${topic} enforces robust encapsulation and deterministic memory operations.\n` +
-        `2. **Time Complexity**: Optimal solution executes in O(N) linear time with O(1) auxiliary space.\n` +
-        `3. **Best Practice**: Always guard against empty inputs before triggering transformations.`;
+      const explanation = `### Solution Explanation: ${topic}\n` +
+        `${content.explanation}\n\n` +
+        `Implemented strictly using concepts from **${mod.title}** in **${scope.language}**.`;
+
+      const fingerprint = generateFingerprint(title, problemStatement, mod.title, domainKey);
+      existingFingerprints.add(fingerprint);
 
       const qId = new mongoose.Types.ObjectId();
 
@@ -245,16 +275,21 @@ async function generateInterviewArenaBatch({ course, mod, topics, domainKey, que
         examples: content.examples,
         starterCode: content.starterCode,
         hints: [
-          `Review the standard operations for ${topic}.`,
-          `Validate edge cases including empty and whitespace-only inputs.`
+          `Focus strictly on ${topic} within ${mod.title}.`,
+          `Check formatting and edge cases in your ${scope.language} output.`
         ],
         xp: diff === 'Easy' ? 15 : diff === 'Medium' ? 25 : 40,
         courseId: course._id,
         moduleId: mod._id,
         topic,
+        topicId,
         targetFeature: 'INTERVIEW_ARENA',
-        verificationStatus: 'verified',
+        questionBankType: 'INTERVIEW_ARENA',
+        questionType: ['coding', 'conceptual', 'scenario', 'behavioral'].includes(content.questionType) ? content.questionType : 'coding',
+        verificationStatus: validation.valid ? 'tested' : 'flagged',
+        isTested: validation.valid,
         referenceSolution: content.referenceSolution,
+        testingSolution: content.referenceSolution,
         explanation,
         tags: [domainKey, 'interview-arena', topic.toLowerCase().replace(/[^a-z0-9]/g, '-'), diff.toLowerCase()],
         isActive: true,
@@ -263,7 +298,6 @@ async function generateInterviewArenaBatch({ course, mod, topics, domainKey, que
 
       questionDocs.push(doc);
 
-      // Prepare test cases
       [...content.visibleTestCases, ...content.hiddenTestCases].forEach(tc => {
         allTestCases.push({
           questionId: qId,
@@ -275,13 +309,12 @@ async function generateInterviewArenaBatch({ course, mod, topics, domainKey, que
         });
       });
 
-      // Prepare registry item
       registryDocs.push({
         questionId: qId,
         source: 'INTERVIEW_ARENA',
         title,
         normalizedTitle: normalizeQuestionText(title),
-        fingerprint: generateFingerprint(title, problemStatement, mod.title, domainKey),
+        fingerprint,
         category: mod.title,
         domain: domainKey,
         isDuplicate: false,
@@ -295,113 +328,10 @@ async function generateInterviewArenaBatch({ course, mod, topics, domainKey, que
 
 /**
  * ──────────────────────────────────────────────────────────────
- * PILLAR 2: GAME HUB CHALLENGES (Batch Oriented)
+ * PILLAR 2: MOCK INTERVIEW GENERATION (Batch Oriented)
  * ──────────────────────────────────────────────────────────────
  */
-async function generateGameHubBatch({ course, mod, topics, domainKey, game, questionsPerTopic = 2 }) {
-  const challengeDocs = [];
-  const registryDocs = [];
-
-  const gameFormats = [
-    { type: 'mcq', diff: 'Beginner', level: 1 },
-    { type: 'output_prediction', diff: 'Intermediate', level: 2 },
-    { type: 'debugging', diff: 'Advanced', level: 3 }
-  ];
-
-  for (let tIdx = 0; tIdx < topics.length; tIdx++) {
-    const topic = topics[tIdx];
-
-    for (let i = 0; i < questionsPerTopic; i++) {
-      const fmt = gameFormats[(tIdx + i) % gameFormats.length];
-      const title = `${topic}: ${fmt.type.replace('_', ' ').toUpperCase()} Quest (${fmt.diff})`;
-
-      let instructions = '';
-      let mcqOptions = [];
-      let starterCode = '';
-      let solutionCode = '';
-      let expectedOutput = '';
-
-      if (fmt.type === 'mcq') {
-        instructions = `Which of the following statements is true regarding **${topic}** in ${course.title}?`;
-        mcqOptions = [
-          { id: 'opt_1', text: `${topic} provides high execution efficiency and structured data manipulation.`, isCorrect: true },
-          { id: 'opt_2', text: `${topic} should be avoided in modern production applications.`, isCorrect: false },
-          { id: 'opt_3', text: `${topic} automatically causes uncaught memory leaks.`, isCorrect: false },
-          { id: 'opt_4', text: `${topic} cannot be tested using automated test suites.`, isCorrect: false }
-        ];
-        expectedOutput = 'opt_1';
-      } else if (fmt.type === 'output_prediction') {
-        starterCode = `// Predict console output for ${topic}\nconst val = "${topic}".length > 0;\nconsole.log(val ? "ACTIVE" : "INACTIVE");`;
-        instructions = `Predict the exact console output of this code snippet testing **${topic}**.`;
-        expectedOutput = 'ACTIVE';
-      } else {
-        starterCode = `function fixMe(input) {\n  // Bug: Returns null instead of processed ${topic}\n  return null;\n}`;
-        solutionCode = `function fixMe(input) {\n  return String(input).toUpperCase();\n}`;
-        instructions = `Identify and fix the bug in this function managing **${topic}**. It must return the formatted string.`;
-        expectedOutput = 'VERIFIED';
-      }
-
-      const detectedTech = detectTechnology({ topic, moduleTitle: mod.title, courseTitle: course.title, domainKey });
-      const cId = new mongoose.Types.ObjectId();
-
-      const challenge = {
-        _id: cId,
-        title,
-        gameSlug: game.slug,
-        levelNumber: fmt.level,
-        category: course.title,
-        difficulty: fmt.diff,
-        type: fmt.type,
-        technology: detectedTech.name,
-        compiler: detectedTech.compiler,
-        language: detectedTech.language || getLanguageForDomain(domainKey),
-        instructions,
-        starterCode,
-        solutionCode,
-        expectedOutput,
-        mcqOptions,
-        testCases: [
-          { input: 'test', expectedOutput: expectedOutput || 'VERIFIED', explanation: 'Sample verification case' }
-        ],
-        hints: [{ hintText: `Carefully inspect standard conventions for ${topic}.`, xpPenalty: 5 }],
-        xpReward: 25,
-        timeLimitSeconds: 120,
-        order: (tIdx * 2) + i + 1,
-        courseId: course._id,
-        moduleId: mod._id,
-        topic,
-        domain: domainKey,
-        targetFeature: 'GAME_HUB',
-        verificationStatus: 'verified',
-        explanation: `Proper implementation of ${topic} ensures resilience and adheres to ${course.title} architecture standards.`,
-        isActive: true
-      };
-
-      challengeDocs.push(challenge);
-
-      registryDocs.push({
-        questionId: cId,
-        source: 'GAME_HUB',
-        title,
-        normalizedTitle: normalizeQuestionText(title),
-        fingerprint: generateFingerprint(title, instructions, course.title, domainKey),
-        category: course.title,
-        domain: domainKey,
-        isDuplicate: false,
-        lastUsedAt: new Date()
-      });
-    }
-  }
-
-  return { challenges: challengeDocs, registryDocs };
-}
-
-/**
- * ──────────────────────────────────────────────────────────────
- * PILLAR 3: MOCK INTERVIEW GENERATION (Batch Oriented)
- * ──────────────────────────────────────────────────────────────
- */
-async function generateMockInterviewBatch({ course, mod, topics, domainKey, questionsPerTopic = 2 }) {
+async function generateMockInterviewBatch({ course, mod, topics, domainKey, scope, questionsPerTopic = 2 }) {
   const count = topics.length * Math.max(1, Math.floor(questionsPerTopic * 0.8));
   if (count === 0) return { questions: [], testCases: [], registryDocs: [] };
 
@@ -410,16 +340,16 @@ async function generateMockInterviewBatch({ course, mod, topics, domainKey, ques
 
   const mockTypes = [
     {
-      titleSuffix: 'Architectural System Scenario',
+      titleSuffix: 'Conceptual & Practical Scenario',
       kind: 'conceptual',
-      promptLead: 'Explain how you would design and optimize',
-      keyConcepts: ['scalability', 'fault tolerance', 'separation of concerns', 'performance']
+      promptLead: 'Explain and implement',
+      keyConcepts: ['syntax accuracy', 'module fundamentals', 'clean output']
     },
     {
-      titleSuffix: 'Technical Optimization & Memory',
+      titleSuffix: 'Live Coding Evaluation',
       kind: 'coding',
-      promptLead: 'Write a robust solution with optimal time complexity handling',
-      keyConcepts: ['linear complexity', 'edge case handling', 'immutability']
+      promptLead: 'Write a clean, verified solution demonstrating',
+      keyConcepts: ['exact specification', 'edge case handling', 'readability']
     }
   ];
 
@@ -429,30 +359,39 @@ async function generateMockInterviewBatch({ course, mod, topics, domainKey, ques
 
   for (let tIdx = 0; tIdx < topics.length; tIdx++) {
     const topic = topics[tIdx];
+    const topicId = buildTopicId(mod._id, topic, tIdx);
 
     for (let i = 0; i < Math.max(1, Math.floor(questionsPerTopic * 0.8)); i++) {
       const qNum = currentNum++;
       const mType = mockTypes[(tIdx + i) % mockTypes.length];
       const diff = (tIdx + i) % 2 === 0 ? 'Medium' : 'Hard';
-      const title = `Mock Interview: ${mType.titleSuffix} - ${topic} (${diff})`;
 
-      const content = buildQuestionContentForTopic(topic, mod.title, course.title, domainKey, i, diff);
+      const { content, validation } = await buildValidatedContentForTopic({
+        topic,
+        mod,
+        scope,
+        courseTitle: course.title,
+        domainKey,
+        baseIndex: tIdx + i,
+        difficulty: diff,
+        runSandbox: true
+      });
+
+      const title = `Mock Interview: ${topic} — ${content.titleSuffix} (${diff})`;
 
       const problemStatement = `### Mock Interview Challenge: ${topic}\n\n` +
-        `**Domain Track**: ${course.title} (${domainKey.toUpperCase()})\n` +
+        `**Course**: ${course.title} | **Module**: ${mod.title}\n` +
         `**Interviewer Prompt**:\n` +
-        `${mType.promptLead} **${topic}** under enterprise constraints. ` +
-        `Detail how errors are trapped, how concurrency or memory is managed, and explain the architectural trade-offs.\n\n` +
+        `${mType.promptLead} **${topic}** strictly using concepts from **${mod.title}**.\n\n` +
+        `${content.description}\n\n` +
         `**Evaluation Focus**:\n` +
-        `- Deep grasp of ${topic}\n` +
-        `- Accurate reasoning and design elegance\n` +
-        `- Clean handling of boundary inputs`;
+        `- Accurate usage of ${topic} in ${scope.language}\n` +
+        `- Exact output formatting`;
 
       const explanation = `### Interviewer Evaluation Guide for ${topic}\n` +
-        `Candidate response should highlight:\n` +
-        `1. Exact definition and core mechanics of ${topic}.\n` +
-        `2. Edge case protection (null values, race conditions, memory bounds).\n` +
-        `3. Comparison with alternative design approaches in ${course.title}.`;
+        `${content.explanation}\n\n` +
+        `1. Core mechanics of ${topic} within ${mod.title}.\n` +
+        `2. Clean ${scope.language} implementation without out-of-scope constructs.`;
 
       const qId = new mongoose.Types.ObjectId();
 
@@ -478,19 +417,23 @@ async function generateMockInterviewBatch({ course, mod, topics, domainKey, ques
         examples: content.examples,
         starterCode: content.starterCode,
         hints: [
-          `Structure your answer around core principles of ${topic}.`,
-          `Explicitly mention real-world trade-offs and error recovery.`
+          `Structure your solution strictly around ${topic}.`,
+          `Verify exact output formatting.`
         ],
         xp: diff === 'Medium' ? 30 : 50,
         courseId: course._id,
         moduleId: mod._id,
         topic,
+        topicId,
         targetFeature: 'MOCK_INTERVIEW',
-        verificationStatus: 'verified',
+        questionBankType: 'MOCK_INTERVIEW',
+        verificationStatus: validation.valid ? 'tested' : 'flagged',
+        isTested: validation.valid,
         referenceSolution: content.referenceSolution,
+        testingSolution: content.referenceSolution,
         explanation,
         keyConcepts: [topic.toLowerCase(), ...mType.keyConcepts],
-        evaluationCriteria: `Candidate response must hit key concepts: ${mType.keyConcepts.join(', ')}.`,
+        evaluationCriteria: `Candidate response must demonstrate ${topic} in ${mod.title}.`,
         tags: [domainKey, 'mock-interview', topic.toLowerCase().replace(/[^a-z0-9]/g, '-')],
         isActive: true,
         isDailyOnly: false
@@ -531,74 +474,56 @@ async function generateMockInterviewBatch({ course, mod, topics, domainKey, ques
  * PILLAR 4: TESTING & PRACTICE TASKS (Sandboxed & Validated)
  * ──────────────────────────────────────────────────────────────
  */
-async function generateTestingPracticeBatch({ course, mod, topics, domainKey }) {
+async function generateTestingPracticeBatch({ course, mod, topics, domainKey, scope }) {
   const taskDocs = [];
   const registryDocs = [];
   const diffs = ['Easy', 'Medium', 'Hard'];
 
   for (let tIdx = 0; tIdx < topics.length; tIdx++) {
     const topic = topics[tIdx];
+    const topicId = buildTopicId(mod._id, topic, tIdx);
     const diff = diffs[tIdx % diffs.length];
-    const content = buildQuestionContentForTopic(topic, mod.title, course.title, domainKey, tIdx, diff);
 
-    const title = `Practice & Test: ${topic} Practical Suite`;
-    const description = `Complete end-to-end hands-on test and verification suite for ${topic} in ${course.title}.`;
+    const { content, validation } = await buildValidatedContentForTopic({
+      topic,
+      mod,
+      scope,
+      courseTitle: course.title,
+      domainKey,
+      baseIndex: tIdx,
+      difficulty: diff,
+      runSandbox: true
+    });
+
+    const title = `Practice & Test: ${topic} — ${content.titleSuffix}`;
+    const description = `Hands-on practice & verification strictly for ${topic} in ${mod.title} (${course.title}).`;
     const problemStatement = `### Task Specifications: ${topic}\n` +
-      `Implement and verify a production-ready solution implementing **${topic}**.\n\n` +
+      `Implement and verify a solution strictly using **${mod.title}** concepts for **${topic}**.\n\n` +
+      `${content.description}\n\n` +
       `**Input Format**:\n${content.inputFormat}\n\n` +
       `**Output Format**:\n${content.outputFormat}\n\n` +
       `**Constraints**:\n${content.constraints}`;
 
     const explanation = `### Solution Rationale & Verification\n` +
-      `The verified solution processes the input sequentially, validating data types and returning the clean expected result.`;
+      `${content.explanation}`;
 
-    const allTestCases = [...content.visibleTestCases, ...content.hiddenTestCases];
-
-    // Real Sandbox Compiler Execution & Output Validation
-    let isTested = false;
-    let verificationStatus = 'verified';
-    let testingResult = { passed: false, actualOutput: '', executionTimeMs: 0, error: null, executedAt: new Date() };
-
-    try {
-      const evalRes = await evaluateCode({
-        code: content.referenceSolution,
-        language: content.lang,
-        testCases: allTestCases,
-        isSubmit: false
-      });
-
-      if (evalRes && evalRes.allPassed) {
-        isTested = true;
-        verificationStatus = 'tested';
-        testingResult = {
+    const isTested = Boolean(validation.valid);
+    const verificationStatus = isTested ? 'tested' : 'flagged';
+    const testingResult = isTested
+      ? {
           passed: true,
-          actualOutput: evalRes.testResults?.[0]?.actual || 'VALIDATED',
-          executionTimeMs: evalRes.executionTimeMs || 10,
+          actualOutput: validation.evalRes?.testResults?.[0]?.actual || 'VALIDATED',
+          executionTimeMs: validation.evalRes?.executionTimeMs || 10,
           error: null,
           executedAt: new Date()
-        };
-      } else {
-        isTested = false;
-        verificationStatus = 'flagged';
-        testingResult = {
+        }
+      : {
           passed: false,
-          actualOutput: evalRes.testResults?.[0]?.actual || '',
-          executionTimeMs: evalRes.executionTimeMs || 0,
-          error: evalRes.error || evalRes.verdict || 'Test case verification mismatch',
+          actualOutput: validation.evalRes?.testResults?.[0]?.actual || '',
+          executionTimeMs: validation.evalRes?.executionTimeMs || 0,
+          error: validation.reason || 'Validation mismatch',
           executedAt: new Date()
         };
-      }
-    } catch (evalErr) {
-      isTested = false;
-      verificationStatus = 'flagged';
-      testingResult = {
-        passed: false,
-        actualOutput: '',
-        executionTimeMs: 0,
-        error: evalErr.message,
-        executedAt: new Date()
-      };
-    }
 
     const taskId = new mongoose.Types.ObjectId();
 
@@ -607,12 +532,14 @@ async function generateTestingPracticeBatch({ course, mod, topics, domainKey }) 
       moduleId: mod._id,
       courseId: course._id,
       domain: domainKey,
+      topic,
+      topicId,
       technology: content.technology,
       compiler: content.compiler,
       evaluationMethod: content.evaluationMethod,
       title,
       description,
-      instructions: `1. Review problem specifications for ${topic}.\n2. Code the solution respecting time and memory limits.\n3. Run test cases and verify all pass.`,
+      instructions: `1. Review problem specifications for ${topic}.\n2. Code the solution using only ${mod.title} concepts.\n3. Run test cases and verify all pass.`,
       problemStatement,
       inputFormat: content.inputFormat,
       outputFormat: content.outputFormat,
@@ -624,9 +551,10 @@ async function generateTestingPracticeBatch({ course, mod, topics, domainKey }) 
       constraints: content.constraints,
       starterCode: content.starterCode[content.lang] || content.starterCode.javascript || '',
       referenceSolution: content.referenceSolution,
+      testingSolution: content.referenceSolution,
       explanation,
       testCases: content.testCases,
-      taskType: 'coding',
+      taskType: content.questionType === 'debugging' ? 'debugging' : 'coding',
       difficulty: diff,
       estimatedTime: diff === 'Easy' ? '20 mins' : diff === 'Medium' ? '30 mins' : '45 mins',
       points: diff === 'Easy' ? 10 : diff === 'Medium' ? 20 : 30,
@@ -655,6 +583,99 @@ async function generateTestingPracticeBatch({ course, mod, topics, domainKey }) 
   }
 
   return { tasks: taskDocs, registryDocs };
+}
+
+/**
+ * ──────────────────────────────────────────────────────────────
+ * PILLAR 5: DAILY CHALLENGE BANK (Separate Bank, isDailyOnly: true)
+ * ──────────────────────────────────────────────────────────────
+ */
+async function generateDailyChallengeBatch({ course, mod, topics, domainKey, scope }) {
+  if (!topics || topics.length === 0) return { questions: [], testCases: [], registryDocs: [] };
+
+  const topic = topics[0];
+  const topicId = buildTopicId(mod._id, topic, 0);
+  const diff = (mod.order || 1) <= 3 ? 'Easy' : (mod.order || 1) <= 10 ? 'Medium' : 'Hard';
+  const startNumber = await getNextQNumberBatch(1);
+
+  const { content, validation } = await buildValidatedContentForTopic({
+    topic,
+    mod,
+    scope,
+    courseTitle: course.title,
+    domainKey,
+    baseIndex: mod.order || 0,
+    difficulty: diff,
+    runSandbox: true
+  });
+
+  const title = `Daily Challenge: ${topic} — ${content.titleSuffix} (${course.title})`;
+  const problemStatement = `### Daily Challenge (${mod.title})\n` +
+    `Solve today's module-aligned challenge for **${topic}**.\n\n` +
+    `${content.description}`;
+
+  const qId = new mongoose.Types.ObjectId();
+  const qNum = startNumber;
+
+  const doc = {
+    _id: qId,
+    questionNumber: qNum,
+    title,
+    category: mod.title,
+    domain: domainKey,
+    technology: content.technology,
+    programmingLanguage: content.lang,
+    compiler: content.compiler,
+    evaluationMethod: content.evaluationMethod,
+    subtopics: [topic],
+    level: 0,
+    difficulty: diff,
+    problemStatement,
+    inputFormat: content.inputFormat,
+    outputFormat: content.outputFormat,
+    constraints: content.constraints,
+    examples: content.examples,
+    starterCode: content.starterCode,
+    hints: [`Apply ${topic} from ${mod.title}.`],
+    xp: 30,
+    courseId: course._id,
+    moduleId: mod._id,
+    topic,
+    topicId,
+    targetFeature: 'DAILY_CHALLENGE',
+    questionBankType: 'DAILY_CHALLENGE',
+    verificationStatus: validation.valid ? 'tested' : 'flagged',
+    isTested: validation.valid,
+    referenceSolution: content.referenceSolution,
+    testingSolution: content.referenceSolution,
+    explanation: content.explanation,
+    tags: [domainKey, 'daily-challenge', topic.toLowerCase().replace(/[^a-z0-9]/g, '-')],
+    isActive: true,
+    isDailyOnly: true
+  };
+
+  const testCases = [...content.visibleTestCases, ...content.hiddenTestCases].map(tc => ({
+    questionId: qId,
+    questionNumber: qNum,
+    input: tc.input,
+    expectedOutput: tc.expectedOutput,
+    isHidden: tc.isHidden || false,
+    explanation: tc.explanation || ''
+  }));
+
+  const registryDocs = [{
+    questionId: qId,
+    source: 'DAILY_CHALLENGE',
+    title,
+    normalizedTitle: normalizeQuestionText(title),
+    fingerprint: generateFingerprint(title, problemStatement, mod.title, domainKey),
+    category: mod.title,
+    domain: domainKey,
+    isDuplicate: false,
+    lastUsedAt: new Date()
+  }];
+
+  return { questions: [doc], testCases, registryDocs };
 }
 
 /**
@@ -790,6 +811,211 @@ async function validateExistingCourseTasks(courseId, domainKey) {
 }
 
 /**
+ * Core single-module strict generation pipeline shared by course generation and single-module updates.
+ * Protects student submissions/progress and regenerates only when forced, incomplete, or topicsSignature changes.
+ */
+async function processModuleGeneration({
+  course,
+  mod,
+  allModules,
+  domainKey,
+  questionsPerTopic = 2,
+  forceRegenerate = false
+}) {
+  const scope = analyzeModuleScope(mod, allModules, course);
+  let topics = (Array.isArray(scope.topics) && scope.topics.length > 0)
+    ? scope.topics.filter(t => t && t.trim().length > 2)
+    : [];
+
+  if (topics.length === 0) {
+    topics = [
+      `${mod.title} Fundamentals & Syntax`,
+      `${mod.title} Core Operations & Practice`,
+      `${mod.title} Applied Concepts`
+    ];
+    scope.topics = topics;
+  }
+
+  const [
+    existingArenaCount,
+    existingMockCount,
+    existingDailyCount,
+    existingTaskCount
+  ] = await Promise.all([
+    InterviewQuestion.countDocuments({ moduleId: mod._id, targetFeature: 'INTERVIEW_ARENA', isActive: true }),
+    InterviewQuestion.countDocuments({ moduleId: mod._id, targetFeature: 'MOCK_INTERVIEW', isActive: true }),
+    InterviewQuestion.countDocuments({ moduleId: mod._id, targetFeature: 'DAILY_CHALLENGE', isActive: true }),
+    DomainTask.countDocuments({ moduleId: mod._id, isActive: true })
+  ]);
+
+  const signatureMatches = Boolean(mod.topicsSignature && mod.topicsSignature === scope.topicsSignature);
+  const allBanksPopulated =
+    existingArenaCount >= topics.length &&
+    existingMockCount >= topics.length &&
+    existingDailyCount >= 1 &&
+    existingTaskCount >= 1;
+
+  if (!forceRegenerate && signatureMatches && allBanksPopulated) {
+    return {
+      skipped: true,
+      questionsCount: existingArenaCount + existingMockCount + existingDailyCount + existingTaskCount,
+      testedCount: 0
+    };
+  }
+
+  let arenaTopicsToGenerate = topics;
+  let mockTopicsToGenerate = topics;
+  let taskTopicsToGenerate = topics;
+  let needDaily = true;
+
+  if (forceRegenerate) {
+    // Protect student submissions and in-progress/completed tasks from deletion
+    const existingIQIds = await InterviewQuestion.find({ moduleId: mod._id }).distinct('_id');
+    const protectedIQIds = existingIQIds.length > 0
+      ? await InterviewSubmission.distinct('questionId', { questionId: { $in: existingIQIds } })
+      : [];
+    const protectedIQSet = new Set(protectedIQIds.map(id => id.toString()));
+    const deletableIQIds = existingIQIds.filter(id => !protectedIQSet.has(id.toString()));
+
+    if (deletableIQIds.length > 0) {
+      await InterviewTestCase.deleteMany({ questionId: { $in: deletableIQIds } });
+      await InterviewQuestion.deleteMany({ _id: { $in: deletableIQIds } });
+    }
+
+    const protectedTaskIds = await StudentDomainProgress.distinct('domainTaskId', {
+      moduleId: mod._id,
+      status: { $in: ['in_progress', 'completed'] }
+    });
+    await DomainTask.deleteMany({
+      moduleId: mod._id,
+      ...(protectedTaskIds.length > 0 ? { _id: { $nin: protectedTaskIds } } : {})
+    });
+  } else {
+    // Non-destructive gap-filling: keep all existing valid active questions & only fill uncovered topics/banks
+    const [arenaTopicSet, mockTopicSet, taskTopicSet] = await Promise.all([
+      InterviewQuestion.distinct('topic', { moduleId: mod._id, targetFeature: 'INTERVIEW_ARENA', isActive: true }),
+      InterviewQuestion.distinct('topic', { moduleId: mod._id, targetFeature: 'MOCK_INTERVIEW', isActive: true }),
+      DomainTask.distinct('topic', { moduleId: mod._id, isActive: true })
+    ]);
+    arenaTopicsToGenerate = topics.filter(t => !arenaTopicSet.includes(t));
+    mockTopicsToGenerate = topics.filter(t => !mockTopicSet.includes(t));
+    taskTopicsToGenerate = topics.filter(t => !taskTopicSet.includes(t));
+    needDaily = existingDailyCount < 1;
+  }
+
+  // Generate only needed question banks/topics in parallel strictly scoped to this module
+  const [arenaBatch, mockBatch, testingBatch, dailyBatch] = await Promise.all([
+    arenaTopicsToGenerate.length > 0
+      ? generateInterviewArenaBatch({ course, mod, topics: arenaTopicsToGenerate, domainKey, scope, questionsPerTopic })
+      : Promise.resolve({ questions: [], testCases: [], registryDocs: [] }),
+    mockTopicsToGenerate.length > 0
+      ? generateMockInterviewBatch({ course, mod, topics: mockTopicsToGenerate, domainKey, scope, questionsPerTopic })
+      : Promise.resolve({ questions: [], testCases: [], registryDocs: [] }),
+    taskTopicsToGenerate.length > 0
+      ? generateTestingPracticeBatch({ course, mod, topics: taskTopicsToGenerate, domainKey, scope })
+      : Promise.resolve({ tasks: [], registryDocs: [] }),
+    needDaily
+      ? generateDailyChallengeBatch({ course, mod, topics, domainKey, scope })
+      : Promise.resolve({ questions: [], testCases: [], registryDocs: [] })
+  ]);
+
+  if (arenaBatch.questions.length > 0) {
+    await InterviewQuestion.insertMany(arenaBatch.questions, { ordered: false });
+  }
+  if (arenaBatch.testCases.length > 0) {
+    await InterviewTestCase.insertMany(arenaBatch.testCases, { ordered: false });
+  }
+  if (mockBatch.questions.length > 0) {
+    await InterviewQuestion.insertMany(mockBatch.questions, { ordered: false });
+  }
+  if (mockBatch.testCases.length > 0) {
+    await InterviewTestCase.insertMany(mockBatch.testCases, { ordered: false });
+  }
+  if (testingBatch.tasks.length > 0) {
+    await DomainTask.insertMany(testingBatch.tasks, { ordered: false });
+  }
+  if (dailyBatch.questions.length > 0) {
+    await InterviewQuestion.insertMany(dailyBatch.questions, { ordered: false });
+  }
+  if (dailyBatch.testCases.length > 0) {
+    await InterviewTestCase.insertMany(dailyBatch.testCases, { ordered: false });
+  }
+
+  const allRegistry = [
+    ...arenaBatch.registryDocs,
+    ...mockBatch.registryDocs,
+    ...testingBatch.registryDocs,
+    ...dailyBatch.registryDocs
+  ];
+  if (allRegistry.length > 0) {
+    try {
+      await QuestionRegistry.insertMany(allRegistry, { ordered: false });
+    } catch (_) {}
+  }
+
+  // Persist synchronized topics & topicsSignature so unchanged modules are skipped next time
+  await Module.findByIdAndUpdate(mod._id, {
+    $set: {
+      topics: scope.topics,
+      topicsSignature: scope.topicsSignature
+    }
+  });
+
+  const modQuestionsCount =
+    arenaBatch.questions.length +
+    mockBatch.questions.length +
+    testingBatch.tasks.length +
+    dailyBatch.questions.length;
+
+  const modTestedCount =
+    arenaBatch.questions.filter(q => q.isTested).length +
+    mockBatch.questions.filter(q => q.isTested).length +
+    testingBatch.tasks.filter(t => t.isTested).length +
+    dailyBatch.questions.filter(q => q.isTested).length;
+
+  return {
+    skipped: false,
+    questionsCount: modQuestionsCount,
+    testedCount: modTestedCount,
+    arenaCount: arenaBatch.questions.length,
+    mockCount: mockBatch.questions.length,
+    testingCount: testingBatch.tasks.length,
+    dailyCount: dailyBatch.questions.length
+  };
+}
+
+/**
+ * Regenerate all question banks for a single module cleanly (e.g. when syllabus topics change).
+ */
+async function generateModuleQuestions(moduleId, options = {}) {
+  const { forceRegenerate = true, questionsPerTopic = 2 } = options;
+  const mod = await Module.findById(moduleId);
+  if (!mod) throw new Error(`Module not found: ${moduleId}`);
+
+  const course = await Course.findById(mod.courseId);
+  if (!course) throw new Error(`Course not found for module: ${moduleId}`);
+
+  // Repair/normalize syllabus topics for the course first so prerequisite scope is accurate
+  await extractCourseSyllabusTopics(course._id);
+  const refreshedMod = await Module.findById(moduleId);
+  const allModules = await Module.find({
+    courseId: course._id,
+    isPublished: { $ne: false }
+  }).sort({ order: 1 });
+
+  const domainKey = normalizeDomainKey(course.slug || course.domain || course.title);
+
+  return processModuleGeneration({
+    course,
+    mod: refreshedMod || mod,
+    allModules,
+    domainKey,
+    questionsPerTopic,
+    forceRegenerate
+  });
+}
+
+/**
  * ──────────────────────────────────────────────────────────────
  * MAIN ORCHESTRATION: PARALLEL GENERATION FOR ALL SYLLABUS MODULES
  * Target: Complete within < 5 minutes under controlled concurrency
@@ -818,22 +1044,22 @@ async function generateSyllabusQuestions(courseId, options = {}) {
       courseTitle: course.title,
       status: 'generating',
       progress: 5,
-      currentStep: 'Analyzing syllabus structure and preparing concurrent workers...'
+      currentStep: 'Analyzing syllabus structure and repairing topic alignment...'
     });
   } else {
     job.status = 'generating';
     job.progress = 5;
-    job.currentStep = 'Analyzing syllabus structure and preparing concurrent workers...';
+    job.currentStep = 'Analyzing syllabus structure and repairing topic alignment...';
     await job.save();
   }
 
   try {
-    // 1. Ensure Domain Game exists
-    const game = await ensureDomainGame(domainKey, course.title);
+    // 1. Normalize syllabus topics from stored modules
+    await extractCourseSyllabusTopics(course._id);
 
-    // 2. Fetch all published syllabus modules
+    // 2. Fetch all published syllabus modules strictly scoped to this courseId
     const modules = await Module.find({
-      $or: [{ courseId: course._id }, { domain: domainKey }],
+      courseId: course._id,
       isPublished: { $ne: false }
     }).sort({ order: 1 });
 
@@ -872,7 +1098,7 @@ async function generateSyllabusQuestions(courseId, options = {}) {
         await SyllabusGenerationJob.findByIdAndUpdate(job._id, {
           $set: {
             currentModule: modTitle || '',
-            currentStep: `Generating 4 modules for: Module ${modOrder} (${modTitle})`,
+            currentStep: `Generating strict syllabus questions for: Module ${modOrder} (${modTitle})`,
             progress: progressPct,
             'stats.completedModules': completedModules,
             'stats.failedBatches': failedBatches,
@@ -899,89 +1125,20 @@ async function generateSyllabusQuestions(courseId, options = {}) {
           }
           await updateProgressSafe(mod.order, mod.title);
 
-          // Check if module already has generated questions (Resume Support)
-          const existingArenaCount = await InterviewQuestion.countDocuments({ moduleId: mod._id, targetFeature: 'INTERVIEW_ARENA' });
-          const existingGameCount = await Challenge.countDocuments({ moduleId: mod._id, targetFeature: 'GAME_HUB' });
-
-          let topics = (Array.isArray(mod.topics) && mod.topics.length > 0)
-            ? mod.topics.filter(t => t && t.trim().length > 2)
-            : [];
-
-          if (topics.length === 0) {
-            topics = [
-              `${mod.title} Fundamentals & Syntax`,
-              `${mod.title} Core Operations & Logic`,
-              `${mod.title} Advanced Application & Integration`
-            ];
-          }
-
-          if (!forceRegenerate && existingArenaCount >= (topics.length * questionsPerTopic) && existingGameCount >= topics.length) {
-            if (mProgressItem) {
-              mProgressItem.status = 'completed';
-              mProgressItem.progress = 100;
-              mProgressItem.questionsCount = existingArenaCount + existingGameCount;
-            }
-            completedModules++;
-            await updateProgressSafe(mod.order, mod.title);
-            continue;
-          }
-
-          // If forceRegenerate, clear previous for this module
-          if (forceRegenerate) {
-            await InterviewQuestion.deleteMany({ moduleId: mod._id });
-            await Challenge.deleteMany({ moduleId: mod._id });
-            await DomainTask.deleteMany({ moduleId: mod._id });
-          }
-
-          // Generate all 4 pillars in parallel
-          const [arenaBatch, gameBatch, mockBatch, testingBatch] = await Promise.all([
-            generateInterviewArenaBatch({ course, mod, topics, domainKey, questionsPerTopic }),
-            generateGameHubBatch({ course, mod, topics, domainKey, game, questionsPerTopic }),
-            generateMockInterviewBatch({ course, mod, topics, domainKey, questionsPerTopic }),
-            generateTestingPracticeBatch({ course, mod, topics, domainKey })
-          ]);
-
-          // Batch database insertions
-          if (arenaBatch.questions.length > 0) {
-            await InterviewQuestion.insertMany(arenaBatch.questions, { ordered: false });
-          }
-          if (arenaBatch.testCases.length > 0) {
-            await InterviewTestCase.insertMany(arenaBatch.testCases, { ordered: false });
-          }
-          if (gameBatch.challenges.length > 0) {
-            await Challenge.insertMany(gameBatch.challenges, { ordered: false });
-          }
-          if (mockBatch.questions.length > 0) {
-            await InterviewQuestion.insertMany(mockBatch.questions, { ordered: false });
-          }
-          if (mockBatch.testCases.length > 0) {
-            await InterviewTestCase.insertMany(mockBatch.testCases, { ordered: false });
-          }
-          if (testingBatch.tasks.length > 0) {
-            await DomainTask.insertMany(testingBatch.tasks, { ordered: false });
-          }
-
-          // Batch Registry insert
-          const allRegistry = [
-            ...arenaBatch.registryDocs,
-            ...gameBatch.registryDocs,
-            ...mockBatch.registryDocs,
-            ...testingBatch.registryDocs
-          ];
-          if (allRegistry.length > 0) {
-            try {
-              await QuestionRegistry.insertMany(allRegistry, { ordered: false });
-            } catch (_) {}
-          }
-
-          const modQuestionsCount = arenaBatch.questions.length + gameBatch.challenges.length + mockBatch.questions.length + testingBatch.tasks.length;
-          const modTestedCount = testingBatch.tasks.filter(t => t.isTested).length;
+          const modRes = await processModuleGeneration({
+            course,
+            mod,
+            allModules: modules,
+            domainKey,
+            questionsPerTopic,
+            forceRegenerate
+          });
 
           if (mProgressItem) {
             mProgressItem.status = 'completed';
             mProgressItem.progress = 100;
-            mProgressItem.questionsCount = modQuestionsCount;
-            mProgressItem.testedCount = modTestedCount;
+            mProgressItem.questionsCount = modRes.questionsCount;
+            mProgressItem.testedCount = modRes.testedCount;
           }
 
           completedModules++;
@@ -1011,38 +1168,38 @@ async function generateSyllabusQuestions(courseId, options = {}) {
     // 5. Compute final live counts from database
     const [
       finalArena,
-      finalGame,
       finalMock,
+      finalDaily,
+      finalModuleQ,
       finalTasks,
       finalTested,
       flaggedArena,
-      flaggedGame,
       flaggedTask
     ] = await Promise.all([
       InterviewQuestion.countDocuments({ courseId: course._id, targetFeature: 'INTERVIEW_ARENA' }),
-      Challenge.countDocuments({ courseId: course._id, targetFeature: 'GAME_HUB' }),
       InterviewQuestion.countDocuments({ courseId: course._id, targetFeature: 'MOCK_INTERVIEW' }),
+      InterviewQuestion.countDocuments({ courseId: course._id, targetFeature: 'DAILY_CHALLENGE' }),
+      InterviewQuestion.countDocuments({ courseId: course._id, targetFeature: 'MODULE_QUESTIONS' }),
       DomainTask.countDocuments({ courseId: course._id }),
       DomainTask.countDocuments({ courseId: course._id, isTested: true }),
       InterviewQuestion.countDocuments({ courseId: course._id, verificationStatus: 'flagged' }),
-      Challenge.countDocuments({ courseId: course._id, verificationStatus: 'flagged' }),
       DomainTask.countDocuments({ courseId: course._id, verificationStatus: 'flagged' })
     ]);
 
-    const totalFinal = finalArena + finalGame + finalMock + finalTasks;
-    const finalFlagged = flaggedArena + flaggedGame + flaggedTask;
+    const totalFinal = finalArena + finalMock + finalDaily + finalModuleQ + finalTasks;
+    const finalFlagged = flaggedArena + flaggedTask;
 
     const finalStats = {
       totalModules,
       completedModules,
       interviewArenaCount: finalArena,
-      gameHubCount: finalGame,
       mockInterviewCount: finalMock,
+      dailyChallengeCount: finalDaily,
       testingPracticeCount: finalTasks,
-      moduleQuestionsCount: 0,
+      moduleQuestionsCount: finalModuleQ,
       totalQuestions: totalFinal,
       verifiedCount: totalFinal - finalFlagged,
-      testedCount: finalTested,
+      testedCount: finalTested + testedSolutionsCount,
       flaggedCount: finalFlagged,
       failedBatches,
       remainingBatches: 0
@@ -1088,37 +1245,52 @@ async function regenerateTopicQuestions({ courseId, moduleId, topic }) {
   const mod = await Module.findById(moduleId);
   if (!mod) throw new Error('Module not found');
 
-  const domainKey = normalizeDomainKey(course.slug || course.domain || course.title);
-  const game = await ensureDomainGame(domainKey, course.title);
+  const allModules = await Module.find({
+    courseId: course._id,
+    isPublished: { $ne: false }
+  }).sort({ order: 1 });
+  const scope = analyzeModuleScope(mod, allModules, course);
 
-  // Remove existing questions for this specific topic
-  await InterviewQuestion.deleteMany({ courseId: course._id, moduleId: mod._id, topic });
-  await Challenge.deleteMany({ courseId: course._id, moduleId: mod._id, topic });
-  await DomainTask.deleteMany({ courseId: course._id, moduleId: mod._id, title: { $regex: topic, $options: 'i' } });
+  const domainKey = normalizeDomainKey(course.slug || course.domain || course.title);
+
+  // Protect submitted questions/tasks while removing unsubmitted ones for this topic
+  const existingTopicIQIds = await InterviewQuestion.find({ courseId: course._id, moduleId: mod._id, topic }).distinct('_id');
+  const submittedIQIds = existingTopicIQIds.length > 0
+    ? await InterviewSubmission.distinct('questionId', { questionId: { $in: existingTopicIQIds } })
+    : [];
+  const submittedSet = new Set(submittedIQIds.map(id => id.toString()));
+  const deletableTopicIQIds = existingTopicIQIds.filter(id => !submittedSet.has(id.toString()));
+
+  if (deletableTopicIQIds.length > 0) {
+    await InterviewTestCase.deleteMany({ questionId: { $in: deletableTopicIQIds } });
+    await InterviewQuestion.deleteMany({ _id: { $in: deletableTopicIQIds } });
+  }
+  await DomainTask.deleteMany({ courseId: course._id, moduleId: mod._id, $or: [{ topic }, { title: { $regex: topic, $options: 'i' } }] });
 
   const topics = [topic];
 
-  const [arenaBatch, gameBatch, mockBatch, testingBatch] = await Promise.all([
-    generateInterviewArenaBatch({ course, mod, topics, domainKey, questionsPerTopic: 2 }),
-    generateGameHubBatch({ course, mod, topics, domainKey, game, questionsPerTopic: 2 }),
-    generateMockInterviewBatch({ course, mod, topics, domainKey, questionsPerTopic: 2 }),
-    generateTestingPracticeBatch({ course, mod, topics, domainKey })
+  const [arenaBatch, mockBatch, testingBatch, dailyBatch] = await Promise.all([
+    generateInterviewArenaBatch({ course, mod, topics, domainKey, scope, questionsPerTopic: 2 }),
+    generateMockInterviewBatch({ course, mod, topics, domainKey, scope, questionsPerTopic: 2 }),
+    generateTestingPracticeBatch({ course, mod, topics, domainKey, scope }),
+    generateDailyChallengeBatch({ course, mod, topics, domainKey, scope })
   ]);
 
   if (arenaBatch.questions.length > 0) await InterviewQuestion.insertMany(arenaBatch.questions, { ordered: false });
   if (arenaBatch.testCases.length > 0) await InterviewTestCase.insertMany(arenaBatch.testCases, { ordered: false });
-  if (gameBatch.challenges.length > 0) await Challenge.insertMany(gameBatch.challenges, { ordered: false });
   if (mockBatch.questions.length > 0) await InterviewQuestion.insertMany(mockBatch.questions, { ordered: false });
   if (mockBatch.testCases.length > 0) await InterviewTestCase.insertMany(mockBatch.testCases, { ordered: false });
   if (testingBatch.tasks.length > 0) await DomainTask.insertMany(testingBatch.tasks, { ordered: false });
+  if (dailyBatch.questions.length > 0) await InterviewQuestion.insertMany(dailyBatch.questions, { ordered: false });
+  if (dailyBatch.testCases.length > 0) await InterviewTestCase.insertMany(dailyBatch.testCases, { ordered: false });
 
   return {
     success: true,
     topic,
     interviewArena: arenaBatch.questions.length,
-    gameHub: gameBatch.challenges.length,
     mockInterview: mockBatch.questions.length,
     testingPractice: testingBatch.tasks.length,
+    dailyChallenge: dailyBatch.questions.length,
     testedCount: testingBatch.tasks.filter(t => t.isTested).length
   };
 }
@@ -1184,9 +1356,9 @@ async function generateAllDomainsGlobalSyllabusQuestions(options = {}) {
 
 module.exports = {
   generateSyllabusQuestions,
+  generateModuleQuestions,
   generateAllDomainsGlobalSyllabusQuestions,
   regenerateTopicQuestions,
   validateExistingCourseTasks,
-  ensureDomainGame,
   normalizeDomainKey
 };

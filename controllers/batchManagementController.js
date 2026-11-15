@@ -749,7 +749,7 @@ exports.getBatchDetails = async (req, res) => {
         })),
         currentCourseName: activeEnr ? (activeEnr.courseId?.title || activeEnr.courseName) : (completedEnrs.length > 0 ? `${completedEnrs[0].courseName} (Completed)` : (batch.courseId?.title || 'None Assigned')),
         enrollmentStatus: activeEnr ? 'ACTIVE' : (completedEnrs.length > 0 ? 'COMPLETED' : 'PENDING'),
-        loginAccessStatus: activeEnr && activeEnr.accountStatus === 'ACTIVE' ? 'ACTIVE' : 'DEACTIVATED'
+        loginAccessStatus: (activeEnr && activeEnr.accountStatus === 'ACTIVE' && u.isActive) ? 'ACTIVE' : 'DEACTIVE'
       };
     });
 
@@ -1235,7 +1235,7 @@ exports.updateBatch = async (req, res) => {
 
 /**
  * DELETE /api/admin/batches/:id/students/:studentUserId
- * Unassign student from batch without deleting student account
+ * Unassign student from batch without deleting student account, preserving historical records
  */
 exports.removeStudentFromBatch = async (req, res) => {
   try {
@@ -1249,9 +1249,27 @@ exports.removeStudentFromBatch = async (req, res) => {
     batch.totalStudents = batch.studentIds.length;
     await batch.save();
 
+    // Preserve completed historical course enrollments while revoking active credentials
+    await CollegeTrainingEnrollment.updateMany(
+      {
+        studentId: studentUserId,
+        collegeTrainingBatchId: id,
+        status: 'COMPLETED'
+      },
+      {
+        $set: {
+          accountStatus: 'REVOKED',
+          credentialsRevokedAt: new Date(),
+          revocationReason: 'Student unassigned from batch'
+        }
+      }
+    );
+
+    // Delete active or pending enrollments for this specific batch
     await CollegeTrainingEnrollment.deleteMany({
       studentId: studentUserId,
-      collegeTrainingBatchId: id
+      collegeTrainingBatchId: id,
+      status: { $in: ['ACTIVE', 'PENDING', 'DROPPED'] }
     });
 
     await StudentProfile.updateOne(
@@ -1261,9 +1279,223 @@ exports.removeStudentFromBatch = async (req, res) => {
 
     return res.json({
       success: true,
-      message: 'Student removed from batch successfully (student profile preserved).'
+      message: 'Student removed from batch successfully (historical records preserved).'
     });
   } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * POST /api/admin/batches/:id/students/:studentUserId/reset-password
+ * Reset student temporary password, force change on next login
+ */
+exports.resetStudentPassword = async (req, res) => {
+  try {
+    const { id: batchId, studentUserId } = req.params;
+    const { customPassword } = req.body;
+
+    const user = await User.findById(studentUserId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Student account not found.' });
+    }
+
+    // Generate random temporary password if customPassword not provided
+    const tempPassword = (customPassword && customPassword.trim())
+      ? customPassword.trim()
+      : `SQ@${Math.random().toString(36).substring(2, 6).toUpperCase()}${Math.floor(100 + Math.random() * 900)}`;
+
+    if (tempPassword.length < 6) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters long.' });
+    }
+
+    // Set new password - pre-save hook will bcrypt hash it automatically
+    user.password = tempPassword;
+    user.mustChangePassword = true;
+    user.isActive = true;
+    await user.save();
+
+    // If CollegeTrainingEnrollment has credentials, sync it
+    await CollegeTrainingEnrollment.updateMany(
+      { studentId: studentUserId, collegeTrainingBatchId: batchId },
+      { $set: { accountStatus: 'ACTIVE' } }
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: 'Temporary password generated successfully.',
+      student: {
+        _id: user._id,
+        name: user.name,
+        username: user.username,
+        studentId: user.studentId
+      },
+      temporaryPassword: tempPassword
+    });
+  } catch (error) {
+    console.error('resetStudentPassword error:', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * PUT /api/admin/batches/:id/students/:studentUserId
+ * Edit student details: studentId, name, department, academicYear, username, email, currentCourse, enrollmentStatus, loginAccess
+ */
+exports.updateBatchStudentDetails = async (req, res) => {
+  try {
+    const { id: batchId, studentUserId } = req.params;
+    const {
+      studentId,
+      name,
+      department,
+      academicYear,
+      username,
+      email,
+      courseId,
+      enrollmentStatus,
+      loginAccess
+    } = req.body;
+
+    const user = await User.findById(studentUserId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Student account not found.' });
+    }
+
+    // Check username uniqueness if changed
+    if (username && username.trim().toLowerCase() !== user.username) {
+      const existingUser = await User.findOne({ username: username.trim().toLowerCase(), _id: { $ne: user._id } });
+      if (existingUser) {
+        return res.status(400).json({ success: false, message: 'Username is already taken by another user.' });
+      }
+      user.username = username.trim().toLowerCase();
+    }
+
+    // Check email uniqueness if changed
+    if (email && email.trim().toLowerCase() !== user.email) {
+      const existingEmail = await User.findOne({ email: email.trim().toLowerCase(), _id: { $ne: user._id } });
+      if (existingEmail) {
+        return res.status(400).json({ success: false, message: 'Email is already in use by another account.' });
+      }
+      user.email = email.trim().toLowerCase();
+    }
+
+    if (name && name.trim()) user.name = name.trim();
+    if (studentId && studentId.trim()) user.studentId = studentId.trim().toUpperCase();
+
+    // Update login access on User if provided
+    if (loginAccess) {
+      const isAccActive = loginAccess === 'ACTIVE';
+      user.isActive = isAccActive;
+    }
+
+    await user.save();
+
+    // Update StudentProfile
+    const profileUpdate = {};
+    if (studentId) profileUpdate.studentId = studentId.trim().toUpperCase();
+    if (department) profileUpdate.department = department.trim();
+    if (academicYear) profileUpdate.academicYear = academicYear;
+    if (courseId) profileUpdate.enrolledCourseId = courseId;
+
+    await StudentProfile.findOneAndUpdate(
+      { userId: user._id },
+      { $set: profileUpdate },
+      { new: true, upsert: true }
+    );
+
+    // Update CollegeTrainingEnrollment
+    const enrollment = await CollegeTrainingEnrollment.findOne({
+      studentId: user._id,
+      collegeTrainingBatchId: batchId
+    });
+
+    if (enrollment) {
+      if (courseId) {
+        enrollment.courseId = courseId;
+      }
+      if (enrollmentStatus) {
+        enrollment.status = enrollmentStatus;
+        if (enrollmentStatus === 'COMPLETED') {
+          enrollment.completionDate = new Date();
+        }
+      }
+      if (loginAccess) {
+        const isAccActive = loginAccess === 'ACTIVE';
+        enrollment.accountStatus = isAccActive ? 'ACTIVE' : 'DEACTIVATED';
+        enrollment.tokenVersion = (enrollment.tokenVersion || 1) + 1;
+        if (!isAccActive) {
+          enrollment.credentialsRevokedAt = new Date();
+          enrollment.revocationReason = 'Deactivated by administrator in Batch Student Lifecycle';
+        } else {
+          enrollment.credentialsRevokedAt = null;
+          enrollment.revocationReason = '';
+        }
+      }
+      if (username) {
+        enrollment.courseUsername = username.trim().toLowerCase();
+      }
+      await enrollment.save();
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Student details updated successfully.',
+      student: {
+        _id: user._id,
+        studentId: user.studentId,
+        name: user.name,
+        username: user.username,
+        email: user.email,
+        department: department || user.department,
+        academicYear: academicYear || user.academicYear,
+        enrollmentStatus: enrollment?.status || enrollmentStatus,
+        loginAccessStatus: user.isActive ? 'ACTIVE' : 'DEACTIVE'
+      }
+    });
+  } catch (error) {
+    console.error('updateBatchStudentDetails error:', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * PATCH /api/admin/batches/:id/students/:studentUserId/status
+ * Quickly toggle student login access between ACTIVE and DEACTIVE with confirmation
+ */
+exports.toggleStudentStatus = async (req, res) => {
+  try {
+    const { id: batchId, studentUserId } = req.params;
+    const { status } = req.body; // 'ACTIVE' or 'DEACTIVE'
+
+    const user = await User.findById(studentUserId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Student account not found.' });
+    }
+
+    const isAccActive = status === 'ACTIVE';
+    user.isActive = isAccActive;
+    await user.save();
+
+    await CollegeTrainingEnrollment.updateMany(
+      { studentId: user._id, collegeTrainingBatchId: batchId },
+      {
+        $set: {
+          accountStatus: isAccActive ? 'ACTIVE' : 'DEACTIVATED',
+          credentialsRevokedAt: isAccActive ? null : new Date(),
+          revocationReason: isAccActive ? '' : 'Deactivated by administrator in Batch Student Lifecycle'
+        },
+        $inc: { tokenVersion: 1 }
+      }
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: `Student account ${isAccActive ? 'ACTIVATED' : 'DEACTIVATED'} successfully.`,
+      loginAccessStatus: isAccActive ? 'ACTIVE' : 'DEACTIVE'
+    });
+  } catch (error) {
+    console.error('toggleStudentStatus error:', error);
     return res.status(500).json({ success: false, message: error.message });
   }
 };

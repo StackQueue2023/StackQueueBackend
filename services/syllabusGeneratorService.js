@@ -1,5 +1,6 @@
 const pdfParseModule = require('pdf-parse');
 const { generateQuestionSpec } = require('./questionSpecificationEngine');
+const { analyzeModuleScope, buildTopicId } = require('./moduleScopeEngine');
 
 /**
  * syllabusGeneratorService.js
@@ -203,189 +204,53 @@ function fallbackSegmentModules(lines, domainKey) {
 }
 
 /**
- * 3. Generate 10 to 15 questions/tasks for each module
+ * 3. Generate 10 to 15 strict module-scoped questions/tasks for each module
  */
-function generateTasksForModule(mod, domainKey = 'java', questionsCount = 12) {
+function generateTasksForModule(mod, domainKey = 'java', questionsCount = 12, allModules = [], course = null) {
   const count = Math.min(15, Math.max(10, questionsCount));
   const modTitle = mod.title;
   const topics = mod.topics && mod.topics.length > 0 ? mod.topics : [modTitle];
+  const scope = analyzeModuleScope(mod, allModules, course || { slug: domainKey, domain: domainKey, title: domainKey });
 
   const tasks = [];
-
-  // Blueprint for 15 progressive tasks
-  const blueprints = [
-    {
-      prefix: 'Concept Primer',
-      type: 'reading',
-      diff: 'Easy',
-      pts: 10,
-      time: '15 mins',
-      tmpl: (t) => `Overview & Architectural Foundation: ${t}`,
-      desc: (t) => `Read and understand core principles, syntax rules, and use cases for ${t}.`,
-      inst: (t) => `1. Review the conceptual architecture of ${t}.\n2. Note down primary keywords and execution lifecycle.\n3. Answer the reflection prompt.`
-    },
-    {
-      prefix: 'Basic Syntax',
-      type: 'coding',
-      diff: 'Easy',
-      pts: 10,
-      time: '20 mins',
-      tmpl: (t) => `Initial Implementation & Declaration: ${t}`,
-      desc: (t) => `Write your first working code declaring and utilizing ${t}.`,
-      inst: (t) => `1. Set up variable and component definitions.\n2. Write the main logic block demonstrating ${t}.\n3. Verify output matches expected format.`,
-      output: 'Execution verified with zero errors'
-    },
-    {
-      prefix: 'Core Operations',
-      type: 'coding',
-      diff: 'Easy',
-      pts: 10,
-      time: '20 mins',
-      tmpl: (t) => `Data Manipulation & Operations in ${t}`,
-      desc: (t) => `Perform input handling, transformations, and output formatting for ${t}.`,
-      inst: (t) => `1. Accept required input values.\n2. Apply transformation logic.\n3. Print formatted result.`
-    },
-    {
-      prefix: 'Logic Building',
-      type: 'coding',
-      diff: 'Easy',
-      pts: 10,
-      time: '25 mins',
-      tmpl: (t) => `Conditional Flows & Algorithmic Handling in ${t}`,
-      desc: (t) => `Implement conditional evaluation and looping rules around ${t}.`,
-      inst: (t) => `1. Construct decision pathways (if-else / match).\n2. Handle boundary cases.\n3. Confirm branch coverage.`
-    },
-    {
-      prefix: 'Intermediate Implementation',
-      type: 'coding',
-      diff: 'Medium',
-      pts: 15,
-      time: '25 mins',
-      tmpl: (t) => `Structured Processing & Methods: ${t}`,
-      desc: (t) => `Organize reusable helper functions and methods for ${t}.`,
-      inst: (t) => `1. Decouple logic into distinct modular functions.\n2. Ensure proper parameter validation.\n3. Return processed results.`
-    },
-    {
-      prefix: 'Validation & Debugging',
-      type: 'debugging',
-      diff: 'Medium',
-      pts: 15,
-      time: '25 mins',
-      tmpl: (t) => `Debug Edge Cases & Runtime Exceptions in ${t}`,
-      desc: (t) => `Identify deliberate logic flaws or null exceptions in provided snippet and fix them.`,
-      inst: (t) => `1. Inspect the provided buggy code block.\n2. Trace edge cases (empty input, null pointers, out-of-bounds).\n3. Submit corrected code.`
-    },
-    {
-      prefix: 'Concept Verification Quiz',
-      type: 'mcq',
-      diff: 'Medium',
-      pts: 15,
-      time: '15 mins',
-      tmpl: (t) => `Multiple Choice Assessment on ${t}`,
-      desc: (t) => `Evaluate deep understanding of memory management, scope, and best practices for ${t}.`,
-      inst: (t) => `1. Analyze the 4 options carefully.\n2. Choose the optimal time-complexity answer.\n3. Review detailed explanation.`
-    },
-    {
-      prefix: 'Practical Task',
-      type: 'practical',
-      diff: 'Medium',
-      pts: 15,
-      time: '30 mins',
-      tmpl: (t) => `Hands-on Lab Exercise: ${t}`,
-      desc: (t) => `Complete an end-to-end practical exercise following industry coding standards.`,
-      inst: (t) => `1. Scaffold clean project directory.\n2. Implement business logic.\n3. Write console logs confirming behavior.`
-    },
-    {
-      prefix: 'Real-World Scenario',
-      type: 'coding',
-      diff: 'Medium',
-      pts: 20,
-      time: '30 mins',
-      tmpl: (t) => `Industry Scenario: Real-time Handling of ${t}`,
-      desc: (t) => `Simulate a customer order, transaction, or user-state processing scenario with ${t}.`,
-      inst: (t) => `1. Parse incoming mock payload.\n2. Apply business rules.\n3. Generate sanitized response JSON or console object.`
-    },
-    {
-      prefix: 'Error Handling & Resilience',
-      type: 'debugging',
-      diff: 'Medium',
-      pts: 15,
-      time: '25 mins',
-      tmpl: (t) => `Exception Recovery & Safe State in ${t}`,
-      desc: (t) => `Implement robust try-catch blocks and graceful fallbacks for unexpected failures.`,
-      inst: (t) => `1. Wrap hazardous calls in exception handlers.\n2. Log specific error message.\n3. Return safe default value.`
-    },
-    {
-      prefix: 'Programming Challenge',
-      type: 'challenge',
-      diff: 'Hard',
-      pts: 25,
-      time: '35 mins',
-      tmpl: (t) => `Competitive Coding Challenge: ${t}`,
-      desc: (t) => `Solve an algorithmic challenge optimizing time and space complexity with ${t}.`,
-      inst: (t) => `1. Achieve O(N) or optimal complexity.\n2. Pass all hidden test cases.\n3. Handle extreme boundary values.`
-    },
-    {
-      prefix: 'Capstone Mini-Project',
-      type: 'project',
-      diff: 'Hard',
-      pts: 30,
-      time: '45 mins',
-      tmpl: (t) => `Mini-Project: Interactive ${t} Solution`,
-      desc: (t) => `Design and code a complete self-contained module demonstrating end-to-end mastery.`,
-      inst: (t) => `1. Combine all concepts learned in this module.\n2. Ensure code is modular, commented, and testable.\n3. Submit implementation or GitHub repository URL.`
-    },
-    {
-      prefix: 'Design Pattern Exercise',
-      type: 'practical',
-      diff: 'Hard',
-      pts: 20,
-      time: '35 mins',
-      tmpl: (t) => `Architecture & Design Pattern Application for ${t}`,
-      desc: (t) => `Apply standard design patterns (Factory, Singleton, Observer, or MVC) to ${t}.`,
-      inst: (t) => `1. Identify pattern requirement.\n2. Refactor procedural code into clean object/functional design.\n3. Verify extensibility.`
-    },
-    {
-      prefix: 'Module Assessment Quiz',
-      type: 'quiz',
-      diff: 'Medium',
-      pts: 20,
-      time: '20 mins',
-      tmpl: (t) => `Module Milestone Quiz: ${t}`,
-      desc: (t) => `Test comprehensive theoretical and practical knowledge across all topics in ${modTitle}.`,
-      inst: (t) => `1. Complete all 10 questions.\n2. Score 80%+ to earn completion badge.`
-    },
-    {
-      prefix: 'Mastery Arena Challenge',
-      type: 'challenge',
-      diff: 'Hard',
-      pts: 30,
-      time: '45 mins',
-      tmpl: (t) => `Final Mastery Evaluation: ${t}`,
-      desc: (t) => `A timed capstone evaluation testing speed, precision, and architectural cleanliness.`,
-      inst: (t) => `1. Read problem statement.\n2. Code solution within time budget.\n3. Pass automated test suite.`
-    }
+  const levels = [
+    { diff: 'Easy', type: 'reading', pts: 10, time: '15 mins', prefix: 'Concept Primer' },
+    { diff: 'Easy', type: 'coding', pts: 10, time: '20 mins', prefix: 'Basic Implementation' },
+    { diff: 'Medium', type: 'coding', pts: 15, time: '25 mins', prefix: 'Structured Practice' },
+    { diff: 'Medium', type: 'practical', pts: 15, time: '30 mins', prefix: 'Hands-on Lab' },
+    { diff: 'Hard', type: 'challenge', pts: 25, time: '35 mins', prefix: 'Module Mastery' }
   ];
 
   for (let i = 0; i < count; i++) {
-    const bp = blueprints[i] || blueprints[i % blueprints.length];
-    const topic = topics[i % topics.length] || modTitle;
-    const taskTitle = `Task ${i + 1} — ${bp.tmpl(topic)}`;
+    const topicIdx = i % topics.length;
+    const topic = topics[topicIdx] || modTitle;
+    const lvl = levels[i % levels.length];
+    const variationIndex = Math.floor(i / topics.length);
 
     const spec = generateQuestionSpec({
-      title: taskTitle,
+      title: `${topic} (${lvl.diff})`,
       topic,
       moduleTitle: modTitle,
+      moduleDescription: mod.description || '',
+      moduleTopics: topics,
+      primaryCategories: scope.primaryCategories,
+      courseTitle: course?.title || domainKey,
       domain: domainKey,
       taskIndex: i + 1,
-      difficulty: bp.diff
+      variationIndex,
+      difficulty: lvl.diff
     });
+
+    const taskTitle = `Task ${i + 1} — ${lvl.prefix}: ${topic} (${spec.titleSuffix})`;
+    const topicId = buildTopicId(mod._id, topic, topicIdx);
 
     tasks.push({
       order: i + 1,
       title: taskTitle,
-      description: bp.desc(topic),
-      instructions: bp.inst(topic),
+      topic,
+      topicId,
+      description: `Focused ${lvl.diff.toLowerCase()} practice strictly covering ${topic} within ${modTitle}.`,
+      instructions: `1. Review ${topic} concepts.\n2. Implement your solution using only ${modTitle} concepts.\n3. Verify all sample and hidden test cases pass.`,
       problemStatement: spec.problemStatement,
       inputFormat: spec.inputFormat,
       outputFormat: spec.outputFormat,
@@ -397,12 +262,15 @@ function generateTasksForModule(mod, domainKey = 'java', questionsCount = 12) {
       expectedOutput: spec.sampleOutput,
       starterCode: spec.starterCode,
       referenceSolution: spec.referenceSolution,
+      testingSolution: spec.referenceSolution,
       explanation: spec.explanation,
       testCases: spec.testCases,
-      taskType: bp.type,
-      difficulty: bp.diff,
-      points: bp.pts,
-      estimatedTime: bp.time,
+      taskType: lvl.type,
+      difficulty: lvl.diff,
+      points: lvl.pts,
+      estimatedTime: lvl.time,
+      technology: scope.technology,
+      compiler: scope.compiler,
       isActive: true,
       isEnabled: true
     });

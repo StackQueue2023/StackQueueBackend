@@ -8,7 +8,7 @@
  * Stops ONLY when manually stopped via SIGINT (Ctrl+C) or SIGTERM.
  */
 
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
@@ -18,6 +18,16 @@ const DAEMON_LOG = path.join(LOGS_DIR, 'daemon.log');
 
 if (!fs.existsSync(LOGS_DIR)) {
   fs.mkdirSync(LOGS_DIR, { recursive: true });
+}
+
+function killProcessTree(pid) {
+  try {
+    if (process.platform === 'win32') {
+      execSync(`taskkill /pid ${pid} /T /F`, { stdio: 'ignore' });
+    } else {
+      process.kill(-pid, 'SIGKILL');
+    }
+  } catch (_) {}
 }
 
 function daemonLog(message, isError = false) {
@@ -118,20 +128,10 @@ function handleManualStop(signal) {
   isManualStop = true;
   daemonLog(`Manual stop received (${signal}). Shutting down gracefully...`);
 
-  if (child && !child.killed) {
-    child.kill('SIGINT');
-
-    // Force terminate child if still hanging after 5s
-    setTimeout(() => {
-      if (child && !child.killed) {
-        daemonLog('Child hung during shutdown. Forcing SIGKILL...');
-        try { child.kill('SIGKILL'); } catch (_) {}
-      }
-      process.exit(0);
-    }, 5000).unref();
-  } else {
-    process.exit(0);
+  if (child && child.pid) {
+    killProcessTree(child.pid);
   }
+  process.exit(0);
 }
 
 process.on('SIGINT', () => handleManualStop('SIGINT'));

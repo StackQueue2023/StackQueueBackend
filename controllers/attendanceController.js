@@ -139,6 +139,14 @@ exports.markStudentAttendance = async (req, res) => {
         { upsert: true, new: true }
       );
       results.push(updated);
+
+      // Sync temporary training daily performance asynchronously/safely
+      try {
+        const { syncStudentDailyPerformance } = require('../services/trainingPerformanceService');
+        await syncStudentDailyPerformance(item.studentId, item.batchId || null, date);
+      } catch (syncErr) {
+        console.warn('syncStudentDailyPerformance warning:', syncErr.message);
+      }
     }
 
     return res.json({

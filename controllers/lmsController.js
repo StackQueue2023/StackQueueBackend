@@ -16,6 +16,7 @@ const FeePlan = require('../models/FeePlan');
 const MonthlyInstallment = require('../models/MonthlyInstallment');
 const PaymentTransaction = require('../models/PaymentTransaction');
 const PaymentReceipt = require('../models/PaymentReceipt');
+const { awardQuestionXpIdempotent } = require('../services/xpEngine');
 
 /**
  * Helper to ensure student has an active FeePlan and Month 1 installment
@@ -298,8 +299,20 @@ exports.adminCreateStudent = async (req, res) => {
       paymentMode,
       paymentDate,
       transactionId,
-      isExistingStudent
+      isExistingStudent,
+      studentCategory,
+      collegeId,
+      department,
+      academicYear,
+      trainingName,
+      trainingDomain,
+      trainingStartDate,
+      trainingEndDate
     } = req.body;
+
+    const normalizedStudentCategory =
+      studentCategory === 'TRAINING_TEMPORARY' ? 'TRAINING_TEMPORARY' : 'REGULAR';
+    const isTemporaryTraining = normalizedStudentCategory === 'TRAINING_TEMPORARY';
 
     const {
       cleanPrefix,
@@ -523,7 +536,7 @@ exports.adminCreateStudent = async (req, res) => {
       if (!selectedBatch) {
         return res.status(404).json({ success: false, message: 'Selected batch not found.' });
       }
-      if (selectedBatch.batchType === 'COLLEGE_TRAINING' || selectedBatch.collegeId) {
+      if (!isTemporaryTraining && (selectedBatch.batchType === 'COLLEGE_TRAINING' || selectedBatch.collegeId)) {
         return res.status(400).json({
           success: false,
           message: 'College Training batches cannot be assigned in regular LMS workflow.'
@@ -539,7 +552,8 @@ exports.adminCreateStudent = async (req, res) => {
       studentId: normStudentId,
       password,
       role: 'student',
-      studentType: 'LMS',
+      studentType: isTemporaryTraining ? 'TRAINING_TEMPORARY' : 'LMS',
+      studentCategory: normalizedStudentCategory,
       phone: phone ? phone.trim() : ''
     });
 
@@ -581,25 +595,33 @@ exports.adminCreateStudent = async (req, res) => {
     const profile = await StudentProfile.create({
       userId: user._id,
       studentId: normStudentId,
-      studentType: 'LMS',
-      enrolledCourseId: finalCourseId,
+      studentType: isTemporaryTraining ? 'TRAINING_TEMPORARY' : 'LMS',
+      studentCategory: normalizedStudentCategory,
+      collegeId: collegeId || selectedBatch?.collegeId || null,
+      department: department || selectedBatch?.department || '',
+      academicYear: academicYear || selectedBatch?.academicYear || '',
+      trainingName: trainingName || selectedBatch?.name || '',
+      trainingDomain: trainingDomain || '',
+      trainingStartDate: trainingStartDate ? new Date(trainingStartDate) : (selectedBatch?.startDate || null),
+      trainingEndDate: trainingEndDate ? new Date(trainingEndDate) : (selectedBatch?.endDate || null),
+      enrolledCourseId: isTemporaryTraining ? null : finalCourseId,
       courseDuration: assignedCourseDuration,
       courseDurationWeeks: assignedCourseWeeks,
       totalHours: assignedTotalHours,
       assignedTutorId: finalTutorId,
       learningMode: finalLearningMode,
       batchId: batchId || null,
-      monthlyFee: parsedMonthlyFee,
-      totalCourseFee: profileTotal,
-      downPaymentCollected: profileDP,
-      remainingPrincipal: profileRem,
-      feePaymentStatus: profileRem === 0 && profileDP > 0 ? 'Paid' : (profileDP > 0 ? 'Partially Paid' : 'Pending'),
-      lastPaymentDate: profileDP > 0 ? (paymentDate ? new Date(paymentDate) : new Date()) : null,
+      monthlyFee: isTemporaryTraining ? 0 : parsedMonthlyFee,
+      totalCourseFee: isTemporaryTraining ? 0 : profileTotal,
+      downPaymentCollected: isTemporaryTraining ? 0 : profileDP,
+      remainingPrincipal: isTemporaryTraining ? 0 : profileRem,
+      feePaymentStatus: isTemporaryTraining ? 'Paid' : (profileRem === 0 && profileDP > 0 ? 'Paid' : (profileDP > 0 ? 'Partially Paid' : 'Pending')),
+      lastPaymentDate: !isTemporaryTraining && profileDP > 0 ? (paymentDate ? new Date(paymentDate) : new Date()) : null,
       totalXp: 100
     });
 
     // Commit student sequence counter for course
-    if (finalCourseId && normStudentId) {
+    if (!isTemporaryTraining && finalCourseId && normStudentId) {
       const parts = normStudentId.split('-');
       const numSeq = parseInt(parts[parts.length - 1], 10);
       if (!isNaN(numSeq)) {
@@ -607,7 +629,7 @@ exports.adminCreateStudent = async (req, res) => {
       }
     }
 
-    if (finalCourseId) {
+    if (!isTemporaryTraining && finalCourseId) {
       await ensureStudentFeePlanAndInstallment({
         user,
         courseId: finalCourseId,
@@ -2132,6 +2154,12 @@ exports.submitConceptTask = async (req, res) => {
       });
     }
 
+    const alreadyCompletedSub = await ConceptTaskSubmission.findOne({
+      studentId,
+      taskId: task._id,
+      status: 'COMPLETED'
+    }).lean();
+
     // Save or update submission
     const submission = await ConceptTaskSubmission.findOneAndUpdate(
       { studentId, taskId: task._id },
@@ -2143,16 +2171,39 @@ exports.submitConceptTask = async (req, res) => {
         output: output || task.expectedOutput,
         marksAwarded: task.marks || 10,
         status: 'COMPLETED',
-        completedAt: new Date()
+        completedAt: alreadyCompletedSub?.completedAt || new Date()
       },
       { upsert: true, new: true }
     );
 
-    // Award XP to student profile
-    await StudentProfile.findOneAndUpdate(
-      { userId: studentId },
-      { $inc: { totalXp: 15, 'stats.challengesSolved': 1 } }
-    );
+    let xpResult;
+    if (!alreadyCompletedSub) {
+      xpResult = await awardQuestionXpIdempotent({
+        studentUserId: studentId,
+        questionId: task._id,
+        feature: 'CONCEPT_TASK',
+        amount: 15,
+        reason: 'concept_task_completed',
+        referenceId: task._id,
+        referenceModel: 'ConceptTask',
+        description: `Completed Concept Task: ${task.taskId || task.title || task._id}`
+      });
+      if (xpResult.awarded) {
+        await StudentProfile.findOneAndUpdate(
+          { userId: studentId },
+          { $inc: { 'stats.challengesSolved': 1 } }
+        );
+      }
+    } else {
+      const curProfile = await StudentProfile.findOne({ userId: studentId }).select('totalXp currentLevel').lean();
+      xpResult = {
+        awarded: false,
+        alreadyCompleted: true,
+        xpAwarded: 0,
+        totalXp: curProfile?.totalXp ?? 0,
+        level: curProfile?.currentLevel ?? null
+      };
+    }
 
     // Count updated submissions for this concept
     const totalConceptTasks = await ConceptTask.countDocuments({ conceptId: task.conceptId, status: 'ACTIVE' });
@@ -2166,8 +2217,16 @@ exports.submitConceptTask = async (req, res) => {
     return res.json({
       success: true,
       message: `✓ Task "${task.taskId}" completed successfully!`,
+      xpAwarded: xpResult.xpAwarded || 0,
+      alreadyCompleted: Boolean(xpResult.alreadyCompleted),
+      totalXp: xpResult.totalXp ?? 0,
+      level: xpResult.level ?? null,
       data: {
         submission,
+        xpAwarded: xpResult.xpAwarded || 0,
+        alreadyCompleted: Boolean(xpResult.alreadyCompleted),
+        totalXp: xpResult.totalXp ?? 0,
+        level: xpResult.level ?? null,
         conceptProgress: {
           completed: completedConceptTasks,
           total: totalConceptTasks,

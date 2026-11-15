@@ -13,14 +13,25 @@ const {
 } = require('../services/syllabusGeneratorService');
 const {
   generateSyllabusQuestions,
+  generateModuleQuestions,
   regenerateTopicQuestions,
   normalizeDomainKey
 } = require('../services/syllabusQuestionGeneratorService');
+const { computeModuleSignature } = require('../services/moduleScopeEngine');
 const {
   generateAllSyllabusQuestionBanks,
   generateSyllabusCoverageReport
 } = require('../services/syllabusQuestionSeederService');
 const { extractCourseSyllabusTopics } = require('../services/syllabusTopicExtractorService');
+const {
+  createAndStartSyllabusJob,
+  resumeSyllabusJob,
+  autoRecoverStalledJobs
+} = require('../services/syllabusBackgroundJobService');
+const {
+  validateQuestionContent,
+  calculateCourseQuestionCounts
+} = require('../services/questionManagementService');
 
 // Standard domains configuration
 const DOMAIN_CONFIG = {
@@ -330,7 +341,7 @@ exports.getModulesWithTasks = async (req, res) => {
 // ─────────────────────────────────────────────────────────
 exports.createModule = async (req, res) => {
   try {
-    const { domain, title, description, order, isPublished, courseId } = req.body;
+    const { domain, title, description, order, isPublished, courseId, topics } = req.body;
 
     if (!domain || !domain.trim()) {
       return res.status(400).json({ success: false, message: 'Domain is required.' });
@@ -350,14 +361,30 @@ exports.createModule = async (req, res) => {
       moduleOrder = lastMod ? lastMod.order + 1 : 1;
     }
 
+    const cleanTopics = Array.isArray(topics)
+      ? topics.map(t => String(t).trim()).filter(Boolean)
+      : [];
+
     const newModule = await Module.create({
       courseId: course._id,
       domain: domainKey,
       title: title.trim(),
       description: description ? description.trim() : '',
+      topics: cleanTopics,
+      topicsSignature: '',
       order: moduleOrder,
       isPublished: isPublished !== false
     });
+
+    if (newModule.isPublished !== false) {
+      setImmediate(async () => {
+        try {
+          await generateModuleQuestions(newModule._id, { forceRegenerate: false });
+        } catch (bgErr) {
+          console.error(`[AdminSyllabus] Auto-generation on new module ${newModule._id} error:`, bgErr.message);
+        }
+      });
+    }
 
     return res.status(201).json({
       success: true,
@@ -382,23 +409,49 @@ exports.createModule = async (req, res) => {
 exports.updateModule = async (req, res) => {
   try {
     const { moduleId } = req.params;
-    const { title, description, order, isPublished } = req.body;
+    const { title, description, order, isPublished, topics } = req.body;
 
     const mod = await Module.findById(moduleId);
     if (!mod) {
       return res.status(404).json({ success: false, message: 'Module not found.' });
     }
 
+    const prevSignature = mod.topicsSignature || computeModuleSignature(mod);
+
     if (title !== undefined) mod.title = title.trim();
     if (description !== undefined) mod.description = description.trim();
     if (order !== undefined) mod.order = Number(order);
     if (isPublished !== undefined) mod.isPublished = Boolean(isPublished);
+    if (Array.isArray(topics)) {
+      mod.topics = topics.map(t => String(t).trim()).filter(t => t.length > 0);
+    }
+
+    const nextSignature = computeModuleSignature(mod);
+    const syllabusChanged = prevSignature !== nextSignature;
+    if (syllabusChanged) {
+      mod.topicsSignature = '';
+    }
 
     await mod.save();
 
+    if (syllabusChanged && mod.courseId) {
+      // Regenerate ONLY this affected module asynchronously when syllabus topics/description change
+      setImmediate(async () => {
+        try {
+          await generateModuleQuestions(mod._id, { forceRegenerate: true });
+          console.log(`[AdminSyllabus] Regenerated module ${mod._id} (${mod.title}) after syllabus update.`);
+        } catch (bgErr) {
+          console.error(`[AdminSyllabus] Background module regeneration error for ${mod._id}:`, bgErr.message);
+        }
+      });
+    }
+
     return res.json({
       success: true,
-      message: 'Module updated successfully.',
+      message: syllabusChanged
+        ? 'Module updated successfully. Questions for this module are regenerating.'
+        : 'Module updated successfully.',
+      regenerationTriggered: Boolean(syllabusChanged && mod.courseId),
       data: mod
     });
   } catch (err) {
@@ -693,7 +746,7 @@ exports.toggleTaskStatus = async (req, res) => {
 // ─────────────────────────────────────────────────────────
 // 12. POST /api/admin/syllabus/upload-pdf
 // Uploads PDF, parses syllabus, splits into modules, and
-// automatically creates 10-15 tasks per module in DB!
+// automatically creates 10-15 tasks per module as a reliable background job!
 // ─────────────────────────────────────────────────────────
 exports.uploadSyllabusPdf = async (req, res) => {
   try {
@@ -701,16 +754,27 @@ exports.uploadSyllabusPdf = async (req, res) => {
 
     // 1. Extract text from uploaded PDF file if present
     if (req.file) {
-      const extracted = await extractTextFromPdf(req.file.buffer);
-      if (extracted && extracted.trim()) {
-        rawText = extracted;
+      try {
+        const extracted = await extractTextFromPdf(req.file.buffer);
+        if (extracted && extracted.trim()) {
+          rawText = extracted;
+        }
+      } catch (pdfErr) {
+        console.error('PDF parsing error in uploadSyllabusPdf:', pdfErr);
+        return res.status(400).json({
+          success: false,
+          message: 'PDF parsing failed. Please verify that the file is a valid, uncorrupted PDF document.',
+          errorType: 'PDF_PARSING_FAILED',
+          details: pdfErr.message
+        });
       }
     }
 
     if (!rawText || !rawText.trim()) {
       return res.status(400).json({
         success: false,
-        message: 'No syllabus content found. Please upload a PDF syllabus file or provide syllabus text.'
+        message: 'No syllabus content found. Please upload a PDF syllabus file or provide syllabus text.',
+        errorType: 'EMPTY_SYLLABUS_CONTENT'
       });
     }
 
@@ -753,181 +817,44 @@ exports.uploadSyllabusPdf = async (req, res) => {
     if (!parsedModules || parsedModules.length === 0) {
       return res.status(400).json({
         success: false,
-        message: 'Could not detect structured modules from the syllabus. Please check the PDF document structure.'
+        message: 'Could not detect structured modules from the syllabus. Please check the PDF document structure.',
+        errorType: 'NO_STRUCTURED_MODULES_DETECTED'
       });
     }
 
-    // 4. Save modules & auto-generate 10-15 tasks each
-    const savedModules = [];
-    let totalGeneratedTasks = 0;
-
-    for (let i = 0; i < parsedModules.length; i++) {
-      const pMod = parsedModules[i];
-      const modOrder = i + 1;
-
-      // Check if module already exists for this course & order
-      let mod = await Module.findOne({
-        courseId: course._id,
-        order: modOrder
-      });
-
-      if (!mod) {
-        mod = await Module.create({
-          courseId: course._id,
-          domain: domainKey,
-          title: pMod.title,
-          description: pMod.description,
-          order: modOrder,
-          isPublished: true
-        });
-      } else {
-        mod.title = pMod.title;
-        mod.description = pMod.description;
-        mod.domain = domainKey;
-        mod.isPublished = true;
-        await mod.save();
-      }
-
-      // Check existing tasks for this module with student progress
-      const existingTasks = await DomainTask.find({ moduleId: mod._id });
-      const tasksWithProgress = await StudentDomainProgress.distinct('domainTaskId', {
-        moduleId: mod._id,
-        status: { $in: ['in_progress', 'completed'] }
-      });
-      const preserveTaskIds = new Set(tasksWithProgress.map(id => id.toString()));
-
-      // Delete tasks that have no student progress so new syllabus tasks take effect
-      const deletableTaskIds = existingTasks
-        .filter(t => !preserveTaskIds.has(t._id.toString()))
-        .map(t => t._id);
-
-      if (deletableTaskIds.length > 0) {
-        await DomainTask.deleteMany({ _id: { $in: deletableTaskIds } });
-      }
-
-      // Generate 10-15 tasks
-      const taskBlueprints = generateTasksForModule(pMod, domainKey, tasksPerModule);
-
-      const tasksToInsert = taskBlueprints.map((tb, j) => ({
-        moduleId: mod._id,
-        courseId: course._id,
-        domain: domainKey,
-        title: tb.title,
-        description: tb.description,
-        instructions: tb.instructions,
-        expectedOutput: tb.expectedOutput,
-        taskType: tb.taskType,
-        difficulty: tb.difficulty,
-        points: tb.points,
-        estimatedTime: tb.estimatedTime,
-        order: j + 1,
-        isActive: true,
-        isEnabled: true
-      }));
-
-      if (tasksToInsert.length > 0) {
-        await DomainTask.insertMany(tasksToInsert);
-        totalGeneratedTasks += tasksToInsert.length;
-      }
-
-      const count = await DomainTask.countDocuments({ moduleId: mod._id, isActive: true });
-      savedModules.push({
-        _id: mod._id,
-        title: mod.title,
-        description: mod.description,
-        order: mod.order,
-        tasksCount: count
-      });
-    }
-
-    // 5. Cleanup / Archive old modules that are no longer part of the updated syllabus
-    const activeModuleIds = new Set(savedModules.map(m => m._id.toString()));
-    const existingDomainModules = await Module.find({
-      $or: [{ courseId: course._id }, { domain: domainKey }]
+    // 4. Delegate heavy generation to resilient background job worker
+    // Returns immediately (< 400ms) with unique jobId so frontend HTTP request NEVER hangs or times out!
+    const job = await createAndStartSyllabusJob({
+      course,
+      domainKey,
+      courseTitle: course.title || courseTitle,
+      rawText,
+      parsedModules,
+      tasksPerModule,
+      isNewCourse
     });
-
-    for (const oldMod of existingDomainModules) {
-      if (!activeModuleIds.has(oldMod._id.toString())) {
-        const hasProgress = await StudentDomainProgress.countDocuments({
-          moduleId: oldMod._id,
-          status: { $in: ['in_progress', 'completed'] }
-        });
-
-        if (hasProgress > 0) {
-          oldMod.isPublished = false;
-          await oldMod.save();
-          await DomainTask.updateMany({ moduleId: oldMod._id }, { $set: { isActive: false } });
-        } else {
-          await DomainTask.deleteMany({ moduleId: oldMod._id });
-          await Module.findByIdAndDelete(oldMod._id);
-        }
-      }
-    }
-
-    // 6. Automatically extract clean topics & generate questions topic-by-topic
-    // (1. Interview Arena, 2. Module Questions, 3. Mock Interview)
-    let generationJobId = null;
-    if (course && course._id) {
-      try {
-        course.syllabusText = rawText;
-        await course.save();
-
-        // Extract and assign clean topics to every module
-        await extractCourseSyllabusTopics(course._id);
-
-        const job = await SyllabusGenerationJob.create({
-          courseId: course._id,
-          domain: domainKey,
-          courseTitle: course.title,
-          status: 'generating',
-          progress: 10,
-          currentStep: 'Extracting syllabus topics and seeding separated question banks...'
-        });
-        generationJobId = job._id;
-
-        // Run asynchronously in background so response completes immediately
-        setImmediate(async () => {
-          try {
-            await generateAllSyllabusQuestionBanks(course._id, {
-              onProgress: async (p) => {
-                job.progress = Math.min(95, 10 + Math.round(p.percent * 0.85));
-                job.currentStep = `Module ${p.moduleOrder}: ${p.moduleTitle} (${p.percent}%)`;
-                await job.save().catch(() => {});
-              }
-            });
-
-            job.status = 'completed';
-            job.progress = 100;
-            job.currentStep = 'All syllabus topics successfully covered across Interview Arena, Module, and Mock banks';
-            await job.save().catch(() => {});
-          } catch (bgErr) {
-            console.error('Background syllabus question generation error:', bgErr);
-            job.status = 'failed';
-            job.currentStep = bgErr.message;
-            await job.save().catch(() => {});
-          }
-        });
-      } catch (genErr) {
-        console.error('Initial auto-generation error:', genErr);
-      }
-    }
 
     return res.json({
       success: true,
-      message: `Syllabus successfully parsed! Created ${savedModules.length} modules and ${totalGeneratedTasks} tasks. Question generation has started in the background.`,
+      message: `Syllabus parsed into ${parsedModules.length} module(s). Task and question generation has started in the background.`,
       data: {
+        jobId: job._id,
+        courseId: course._id,
+        courseTitle: course.title,
         domain: domainKey,
-        courseId: course ? course._id : null,
-        courseTitle: course ? course.title : courseTitle,
-        totalModules: savedModules.length,
-        totalGeneratedTasks,
-        modules: savedModules,
-        generationJobId
+        totalModules: parsedModules.length,
+        status: 'generating',
+        progress: job.progress || 5
       }
     });
+
   } catch (err) {
     console.error('uploadSyllabusPdf error:', err);
-    return res.status(500).json({ success: false, message: err.message });
+    return res.status(500).json({
+      success: false,
+      message: err.message || 'Server encountered an error while initializing syllabus generation job.',
+      errorType: 'SYLLABUS_INITIALIZATION_ERROR'
+    });
   }
 };
 
@@ -943,21 +870,16 @@ exports.getGenerationStatus = async (req, res) => {
     if (courseId === 'overall') {
       const [
         interviewArenaCount,
-        gameHubCount,
         mockInterviewCount,
         testingPracticeCount,
         testedSolutionsCount,
         flaggedArena,
-        flaggedGame,
         flaggedTask,
         totalModulesCount,
         totalCoursesCount
       ] = await Promise.all([
         InterviewQuestion.countDocuments({
           targetFeature: { $in: ['INTERVIEW_ARENA', 'interview'] },
-          isActive: true
-        }),
-        Challenge.countDocuments({
           isActive: true
         }),
         InterviewQuestion.countDocuments({
@@ -973,9 +895,6 @@ exports.getGenerationStatus = async (req, res) => {
         InterviewQuestion.countDocuments({
           verificationStatus: 'flagged'
         }),
-        Challenge.countDocuments({
-          verificationStatus: 'flagged'
-        }),
         DomainTask.countDocuments({
           verificationStatus: 'flagged'
         }),
@@ -987,8 +906,8 @@ exports.getGenerationStatus = async (req, res) => {
         })
       ]);
 
-      const flaggedQuestionsCount = flaggedArena + flaggedGame + flaggedTask;
-      const totalQuestions = interviewArenaCount + gameHubCount + mockInterviewCount + testingPracticeCount;
+      const flaggedQuestionsCount = flaggedArena + flaggedTask;
+      const totalQuestions = interviewArenaCount + mockInterviewCount + testingPracticeCount;
 
       return res.json({
         success: true,
@@ -1003,7 +922,6 @@ exports.getGenerationStatus = async (req, res) => {
           },
           counts: {
             interviewArena: interviewArenaCount,
-            gameHub: gameHubCount,
             mockInterview: mockInterviewCount,
             testingPractice: testingPracticeCount,
             total: totalQuestions,
@@ -1016,79 +934,46 @@ exports.getGenerationStatus = async (req, res) => {
       });
     }
 
-    const course = await Course.findById(courseId);
-    if (!course) {
-      return res.status(404).json({ success: false, message: 'Course not found.' });
+    let course = null;
+    let latestJob = null;
+
+    if (mongoose.Types.ObjectId.isValid(courseId)) {
+      // 1. Check if courseId is actually a jobId
+      latestJob = await SyllabusGenerationJob.findById(courseId);
+      if (latestJob) {
+        course = await Course.findById(latestJob.courseId);
+      } else {
+        // 2. Check if courseId is a Course document ID
+        course = await Course.findById(courseId);
+        if (course) {
+          latestJob = await SyllabusGenerationJob.findOne({ courseId: course._id }).sort({ createdAt: -1 });
+        }
+      }
+    }
+
+    if (!course && !latestJob) {
+      return res.status(404).json({ success: false, message: 'Course or generation record not found.' });
+    }
+
+    if (!course && latestJob) {
+      course = { _id: latestJob.courseId, title: latestJob.courseTitle, slug: latestJob.domain, domain: latestJob.domain };
     }
 
     const domainKey = normalizeDomainKey(course.slug || course.domain || course.title);
-    let latestJob = await SyllabusGenerationJob.findOne({ courseId }).sort({ createdAt: -1 });
 
     // Auto-heal stale jobs (> 3 minutes without update)
     if (latestJob && latestJob.status === 'generating') {
       const msSinceLastUpdate = Date.now() - new Date(latestJob.updatedAt).getTime();
       if (msSinceLastUpdate > 180000) {
         latestJob.status = 'failed';
-        latestJob.error = 'Generation stalled or server was restarted. Click Regenerate or Retry to resume.';
+        latestJob.error = 'Generation stalled or server was restarted. Click Resume to continue from last saved module without data loss.';
+        latestJob.recoveryStatus = 'recovering';
         await latestJob.save();
       }
     }
 
-    // Parallel counts from collections
-    const [
-      interviewArenaCount,
-      gameHubCount,
-      mockInterviewCount,
-      testingPracticeCount,
-      testedSolutionsCount,
-      flaggedArena,
-      flaggedGame,
-      flaggedTask,
-      totalModulesCount
-    ] = await Promise.all([
-      InterviewQuestion.countDocuments({
-        $or: [{ courseId: course._id }, { domain: domainKey }],
-        targetFeature: 'INTERVIEW_ARENA',
-        isActive: true
-      }),
-      Challenge.countDocuments({
-        $or: [{ courseId: course._id }, { domain: domainKey }],
-        targetFeature: 'GAME_HUB',
-        isActive: true
-      }),
-      InterviewQuestion.countDocuments({
-        $or: [{ courseId: course._id }, { domain: domainKey }],
-        targetFeature: 'MOCK_INTERVIEW',
-        isActive: true
-      }),
-      DomainTask.countDocuments({
-        $or: [{ courseId: course._id }, { domain: domainKey }],
-        isActive: true
-      }),
-      DomainTask.countDocuments({
-        $or: [{ courseId: course._id }, { domain: domainKey }],
-        isTested: true
-      }),
-      InterviewQuestion.countDocuments({
-        $or: [{ courseId: course._id }, { domain: domainKey }],
-        verificationStatus: 'flagged'
-      }),
-      Challenge.countDocuments({
-        $or: [{ courseId: course._id }, { domain: domainKey }],
-        verificationStatus: 'flagged'
-      }),
-      DomainTask.countDocuments({
-        $or: [{ courseId: course._id }, { domain: domainKey }],
-        verificationStatus: 'flagged'
-      }),
-      Module.countDocuments({
-        $or: [{ courseId: course._id }, { domain: domainKey }],
-        isPublished: { $ne: false }
-      })
-    ]);
-
-    const flaggedQuestionsCount = flaggedArena + flaggedGame + flaggedTask;
-    const totalQuestions = interviewArenaCount + gameHubCount + mockInterviewCount + testingPracticeCount;
+    // Parallel accurate counts strictly from database collections
+    const counts = await calculateCourseQuestionCounts(course._id, domainKey);
 
     return res.json({
       success: true,
@@ -1097,20 +982,11 @@ exports.getGenerationStatus = async (req, res) => {
         courseTitle: course.title,
         domain: domainKey,
         job: latestJob || {
-          status: (interviewArenaCount > 0 || testingPracticeCount > 0) ? 'completed' : 'pending',
-          progress: (interviewArenaCount > 0 || testingPracticeCount > 0) ? 100 : 0,
+          status: (counts.interviewArena > 0 || counts.testingPractice > 0) ? 'completed' : 'pending',
+          progress: (counts.interviewArena > 0 || counts.testingPractice > 0) ? 100 : 0,
           currentStep: 'Idle'
         },
-        counts: {
-          interviewArena: interviewArenaCount,
-          gameHub: gameHubCount,
-          mockInterview: mockInterviewCount,
-          testingPractice: testingPracticeCount,
-          total: totalQuestions,
-          testedSolutions: testedSolutionsCount,
-          flagged: flaggedQuestionsCount,
-          totalModules: totalModulesCount
-        }
+        counts
       }
     });
   } catch (err) {
@@ -1147,7 +1023,6 @@ exports.getCourseQuestions = async (req, res) => {
 
     let interviewArenaList = [];
     let moduleQuestionsList = [];
-    let gameHubList = [];
     let mockInterviewList = [];
     let testingPracticeList = [];
 
@@ -1163,13 +1038,6 @@ exports.getCourseQuestions = async (req, res) => {
       moduleQuestionsList = await InterviewQuestion.find({
         ...queryFilter,
         targetFeature: 'MODULE_QUESTIONS'
-      }).populate('moduleId', 'title order').sort({ createdAt: -1 }).limit(100);
-    }
-
-    if (!targetFeature || targetFeature === 'all' || targetFeature === 'GAME_HUB') {
-      gameHubList = await Challenge.find({
-        ...queryFilter,
-        targetFeature: 'GAME_HUB'
       }).populate('moduleId', 'title order').sort({ createdAt: -1 }).limit(100);
     }
 
@@ -1192,7 +1060,6 @@ exports.getCourseQuestions = async (req, res) => {
         course: { _id: course._id, title: course.title, domain: domainKey },
         interviewArena: interviewArenaList,
         moduleQuestions: moduleQuestionsList,
-        gameHub: gameHubList,
         mockInterview: mockInterviewList,
         testingPractice: testingPracticeList
       }
@@ -1245,7 +1112,6 @@ exports.triggerGenerateCourseQuestions = async (req, res) => {
         totalModules: 0,
         completedModules: 0,
         interviewArenaCount: 0,
-        gameHubCount: 0,
         mockInterviewCount: 0,
         testingPracticeCount: 0,
         totalQuestions: 0,
@@ -1332,20 +1198,25 @@ exports.retryGeneration = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Job not found.' });
     }
 
-    job.status = 'generating';
-    job.progress = 5;
-    job.currentStep = 'Resuming question generation in background...';
-    await job.save();
+    if (job.parsedModules && job.parsedModules.length > 0) {
+      await resumeSyllabusJob(job._id);
+    } else {
+      job.status = 'generating';
+      job.recoveryStatus = 'resumed';
+      job.retryCount = (job.retryCount || 0) + 1;
+      job.currentStep = 'Resuming question generation in background...';
+      await job.save();
 
-    setImmediate(() => {
-      generateSyllabusQuestions(job.courseId, { jobId: job._id, forceRegenerate: false }).catch(err => {
-        console.error('[Retry Background Generation Error]:', err);
+      setImmediate(() => {
+        generateSyllabusQuestions(job.courseId, { jobId: job._id, forceRegenerate: false }).catch(err => {
+          console.error('[Retry Background Generation Error]:', err);
+        });
       });
-    });
+    }
 
     return res.json({
       success: true,
-      message: 'Generation job resumed in background.',
+      message: 'Generation job resumed from last completed module.',
       data: { jobId: job._id, status: 'generating' }
     });
   } catch (err) {
@@ -1355,55 +1226,146 @@ exports.retryGeneration = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────
+// POST /api/admin/syllabus/cancel-job/:jobId
+// Safely halts a generation job without deleting already saved tasks
+// ─────────────────────────────────────────────────────────
+exports.cancelJob = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const job = await SyllabusGenerationJob.findById(jobId);
+    if (!job) {
+      return res.status(404).json({ success: false, message: 'Job not found.' });
+    }
+
+    job.status = 'cancelled';
+    job.error = 'Generation cancelled by administrator. Saved modules and tasks have been preserved.';
+    job.currentStep = 'Generation cancelled by administrator. Saved tasks are preserved.';
+    job.completedAt = new Date();
+    await job.save();
+
+    return res.json({
+      success: true,
+      message: 'Generation job cancelled successfully. All completed modules and saved tasks are preserved.',
+      data: { jobId: job._id, status: 'cancelled' }
+    });
+  } catch (err) {
+    console.error('cancelJob error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────
 // 18. PUT /api/admin/syllabus/question/:type/:id
-// Review and edit a question, its answer, or its explanation
+// Review and edit a question, rerun compiler/MCQ validation, and update audit log
 // ─────────────────────────────────────────────────────────
 exports.updateQuestion = async (req, res) => {
   try {
     const { type, id } = req.params;
-    const { title, problemStatement, referenceSolution, explanation, difficulty, instructions, expectedOutput } = req.body;
+    const body = req.body;
 
-    if (type === 'interview' || type === 'mock') {
-      const q = await InterviewQuestion.findById(id);
-      if (!q) return res.status(404).json({ success: false, message: 'Question not found.' });
+    let doc = null;
 
-      if (title !== undefined) q.title = title.trim();
-      if (problemStatement !== undefined) q.problemStatement = problemStatement;
-      if (referenceSolution !== undefined) q.referenceSolution = referenceSolution;
-      if (explanation !== undefined) q.explanation = explanation;
-      if (difficulty !== undefined) q.difficulty = difficulty;
-
-      await q.save();
-      return res.json({ success: true, message: 'Question updated successfully.', data: q });
-    } else if (type === 'game') {
-      const c = await Challenge.findById(id);
-      if (!c) return res.status(404).json({ success: false, message: 'Challenge not found.' });
-
-      if (title !== undefined) c.title = title.trim();
-      if (instructions !== undefined) c.instructions = instructions;
-      if (referenceSolution !== undefined) c.solutionCode = referenceSolution;
-      if (expectedOutput !== undefined) c.expectedOutput = expectedOutput;
-      if (explanation !== undefined) c.explanation = explanation;
-      if (difficulty !== undefined) c.difficulty = difficulty;
-
-      await c.save();
-      return res.json({ success: true, message: 'Challenge updated successfully.', data: c });
+    if (type === 'interview' || type === 'mock' || type === 'question') {
+      doc = await InterviewQuestion.findById(id);
     } else if (type === 'task' || type === 'testing') {
-      const t = await DomainTask.findById(id);
-      if (!t) return res.status(404).json({ success: false, message: 'Task not found.' });
-
-      if (title !== undefined) t.title = title.trim();
-      if (problemStatement !== undefined) t.problemStatement = problemStatement;
-      if (referenceSolution !== undefined) t.referenceSolution = referenceSolution;
-      if (expectedOutput !== undefined) t.expectedOutput = expectedOutput;
-      if (explanation !== undefined) t.explanation = explanation;
-      if (difficulty !== undefined) t.difficulty = difficulty;
-
-      await t.save();
-      return res.json({ success: true, message: 'Practice task updated successfully.', data: t });
+      doc = await DomainTask.findById(id);
+    } else if (type === 'game') {
+      doc = await Challenge.findById(id);
     }
 
-    return res.status(400).json({ success: false, message: 'Invalid question type specified.' });
+    if (!doc) {
+      return res.status(404).json({ success: false, message: 'Question or task not found.' });
+    }
+
+    const previousStatus = doc.verificationStatus || 'verified';
+
+    // Apply edited fields preserving original _id
+    if (body.title !== undefined) doc.title = body.title.trim();
+    if (body.problemStatement !== undefined) doc.problemStatement = body.problemStatement;
+    if (body.description !== undefined) doc.description = body.description;
+    if (body.inputFormat !== undefined) doc.inputFormat = body.inputFormat;
+    if (body.outputFormat !== undefined) doc.outputFormat = body.outputFormat;
+    if (body.constraints !== undefined) doc.constraints = body.constraints;
+    if (body.sampleInput !== undefined) doc.sampleInput = body.sampleInput;
+    if (body.sampleOutput !== undefined) doc.sampleOutput = body.sampleOutput;
+    if (body.expectedOutput !== undefined) doc.expectedOutput = body.expectedOutput;
+    if (body.difficulty !== undefined) doc.difficulty = body.difficulty;
+    if (body.points !== undefined) doc.points = Number(body.points) || 10;
+    if (body.referenceSolution !== undefined) {
+      doc.referenceSolution = body.referenceSolution;
+      if (doc.solutionCode !== undefined) doc.solutionCode = body.referenceSolution;
+      if (doc.testingSolution !== undefined) doc.testingSolution = body.referenceSolution;
+    }
+    if (body.testCases !== undefined && Array.isArray(body.testCases)) {
+      doc.testCases = body.testCases;
+    }
+    if (body.explanation !== undefined) doc.explanation = body.explanation;
+    if (body.options !== undefined && Array.isArray(body.options)) {
+      doc.options = body.options;
+    }
+    if (body.correctAnswer !== undefined) {
+      doc.correctAnswer = body.correctAnswer;
+    }
+    if (body.compiler !== undefined) doc.compiler = body.compiler;
+    if (body.technology !== undefined) doc.technology = body.technology;
+
+    // Run Compiler / MCQ Validation
+    const validation = await validateQuestionContent({
+      doc,
+      fields: body,
+      language: doc.compiler || doc.technology || doc.domain || 'javascript'
+    });
+
+    doc.lastValidatedAt = new Date();
+    doc.updatedBy = req.user?._id || null;
+
+    if (validation.isValid) {
+      doc.verificationStatus = 'tested';
+      doc.isTested = true;
+      doc.flagReason = '';
+      doc.compilerError = null;
+      doc.failedTestCases = [];
+      doc.recoveredAt = new Date();
+    } else {
+      doc.verificationStatus = 'flagged';
+      doc.isTested = false;
+      doc.flagReason = validation.reason || 'Validation failed';
+      doc.compilerError = validation.compilerError || null;
+      doc.failedTestCases = validation.failedTestCases || [];
+      if (!doc.flaggedAt) doc.flaggedAt = new Date();
+    }
+
+    if (!Array.isArray(doc.auditHistory)) doc.auditHistory = [];
+    doc.auditHistory.push({
+      action: 'EDIT',
+      performedBy: req.user?._id || null,
+      performedByName: req.user?.name || req.user?.email || 'Admin',
+      timestamp: new Date(),
+      reason: validation.isValid
+        ? 'Question edited and compiler validation passed.'
+        : `Question edited but validation failed: ${validation.reason}`,
+      previousStatus,
+      newStatus: doc.verificationStatus,
+      details: {
+        isValid: validation.isValid,
+        reason: validation.reason,
+        compilerError: validation.compilerError
+      }
+    });
+
+    await doc.save();
+
+    const counts = await calculateCourseQuestionCounts(doc.courseId, doc.domain);
+
+    return res.json({
+      success: true,
+      message: validation.isValid
+        ? 'Question saved and compiler validation passed successfully!'
+        : `Question saved, but flagged: ${validation.reason}`,
+      data: doc,
+      validation,
+      counts
+    });
   } catch (err) {
     console.error('updateQuestion error:', err);
     return res.status(500).json({ success: false, message: err.message });
@@ -1411,35 +1373,451 @@ exports.updateQuestion = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────
+// DELETE /api/admin/syllabus/question/:type/:id
+// Safely archives question, preserves student submissions, and updates counts
+// ─────────────────────────────────────────────────────────
+exports.deleteQuestion = async (req, res) => {
+  try {
+    const { type, id } = req.params;
+    let doc = null;
+
+    if (type === 'interview' || type === 'mock' || type === 'question') {
+      doc = await InterviewQuestion.findById(id);
+    } else if (type === 'task' || type === 'testing') {
+      doc = await DomainTask.findById(id);
+    } else if (type === 'game') {
+      doc = await Challenge.findById(id);
+    }
+
+    if (!doc) {
+      return res.status(404).json({ success: false, message: 'Question or task not found.' });
+    }
+
+    // Safety check: Prevent deletion if active generation job is running on this course
+    if (doc.courseId) {
+      const activeJob = await SyllabusGenerationJob.findOne({
+        courseId: doc.courseId,
+        status: 'generating'
+      });
+      if (activeJob) {
+        return res.status(400).json({
+          success: false,
+          message: 'Cannot delete question while AI syllabus generation is actively processing this course. Please pause or cancel generation first.'
+        });
+      }
+    }
+
+    // Soft delete to preserve student progress, submissions, and audit log
+    doc.isActive = false;
+    if (!Array.isArray(doc.auditHistory)) doc.auditHistory = [];
+    doc.auditHistory.push({
+      action: 'DELETE',
+      performedBy: req.user?._id || null,
+      performedByName: req.user?.name || req.user?.email || 'Admin',
+      timestamp: new Date(),
+      reason: req.body?.reason || 'Question deleted by administrator.',
+      previousStatus: doc.verificationStatus || 'verified',
+      newStatus: 'DELETED'
+    });
+
+    await doc.save();
+
+    const counts = await calculateCourseQuestionCounts(doc.courseId, doc.domain);
+
+    return res.json({
+      success: true,
+      message: `"${doc.title}" deleted successfully.`,
+      counts
+    });
+  } catch (err) {
+    console.error('deleteQuestion error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────
+// POST /api/admin/syllabus/question/:type/:id/revalidate
+// Reruns compiler/MCQ validation without editing content
+// ─────────────────────────────────────────────────────────
+exports.revalidateQuestion = async (req, res) => {
+  try {
+    const { type, id } = req.params;
+    let doc = null;
+
+    if (type === 'interview' || type === 'mock' || type === 'question') {
+      doc = await InterviewQuestion.findById(id);
+    } else if (type === 'task' || type === 'testing') {
+      doc = await DomainTask.findById(id);
+    }
+
+    if (!doc) {
+      return res.status(404).json({ success: false, message: 'Question not found.' });
+    }
+
+    const previousStatus = doc.verificationStatus || 'pending';
+
+    const validation = await validateQuestionContent({
+      doc,
+      language: doc.compiler || doc.technology || doc.domain || 'javascript'
+    });
+
+    doc.lastValidatedAt = new Date();
+
+    if (validation.isValid) {
+      doc.verificationStatus = 'tested';
+      doc.isTested = true;
+      doc.flagReason = '';
+      doc.compilerError = null;
+      doc.failedTestCases = [];
+      doc.recoveredAt = new Date();
+    } else {
+      doc.verificationStatus = 'flagged';
+      doc.isTested = false;
+      doc.flagReason = validation.reason || 'Validation failed';
+      doc.compilerError = validation.compilerError || null;
+      doc.failedTestCases = validation.failedTestCases || [];
+      if (!doc.flaggedAt) doc.flaggedAt = new Date();
+    }
+
+    if (!Array.isArray(doc.auditHistory)) doc.auditHistory = [];
+    doc.auditHistory.push({
+      action: 'REVALIDATE',
+      performedBy: req.user?._id || null,
+      performedByName: req.user?.name || req.user?.email || 'Admin',
+      timestamp: new Date(),
+      reason: validation.isValid ? 'Revalidation passed.' : `Revalidation failed: ${validation.reason}`,
+      previousStatus,
+      newStatus: doc.verificationStatus,
+      details: validation
+    });
+
+    await doc.save();
+
+    const counts = await calculateCourseQuestionCounts(doc.courseId, doc.domain);
+
+    return res.json({
+      success: validation.isValid,
+      message: validation.isValid
+        ? 'Validation passed! Question is tested & verified.'
+        : `Validation failed: ${validation.reason}`,
+      data: doc,
+      validation,
+      counts
+    });
+  } catch (err) {
+    console.error('revalidateQuestion error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────
+// POST /api/admin/syllabus/question/:type/:id/recover
+// Recovers a flagged question only if validation passes
+// ─────────────────────────────────────────────────────────
+exports.recoverQuestion = async (req, res) => {
+  try {
+    const { type, id } = req.params;
+    let doc = null;
+
+    if (type === 'interview' || type === 'mock' || type === 'question') {
+      doc = await InterviewQuestion.findById(id);
+    } else if (type === 'task' || type === 'testing') {
+      doc = await DomainTask.findById(id);
+    }
+
+    if (!doc) {
+      return res.status(404).json({ success: false, message: 'Question not found.' });
+    }
+
+    const validation = await validateQuestionContent({
+      doc,
+      language: doc.compiler || doc.technology || doc.domain || 'javascript'
+    });
+
+    doc.lastValidatedAt = new Date();
+
+    if (!validation.isValid) {
+      // Do not allow marking as tested if validation fails!
+      doc.verificationStatus = 'flagged';
+      doc.isTested = false;
+      doc.flagReason = validation.reason || 'Recovery failed validation.';
+      doc.compilerError = validation.compilerError || null;
+      doc.failedTestCases = validation.failedTestCases || [];
+
+      if (!Array.isArray(doc.auditHistory)) doc.auditHistory = [];
+      doc.auditHistory.push({
+        action: 'RECOVER',
+        performedBy: req.user?._id || null,
+        performedByName: req.user?.name || req.user?.email || 'Admin',
+        timestamp: new Date(),
+        reason: `Recovery attempted but validation failed: ${validation.reason}`,
+        previousStatus: 'flagged',
+        newStatus: 'flagged',
+        details: validation
+      });
+
+      await doc.save();
+      const counts = await calculateCourseQuestionCounts(doc.courseId, doc.domain);
+
+      return res.status(400).json({
+        success: false,
+        message: `Recovery failed: ${validation.reason}`,
+        flagReason: validation.reason,
+        compilerError: validation.compilerError,
+        failedTestCases: validation.failedTestCases,
+        data: doc,
+        counts
+      });
+    }
+
+    // Validation passed! Safely recover question
+    doc.verificationStatus = 'tested';
+    doc.isTested = true;
+    doc.flagReason = '';
+    doc.compilerError = null;
+    doc.failedTestCases = [];
+    doc.recoveredAt = new Date();
+
+    if (!Array.isArray(doc.auditHistory)) doc.auditHistory = [];
+    doc.auditHistory.push({
+      action: 'RECOVER',
+      performedBy: req.user?._id || null,
+      performedByName: req.user?.name || req.user?.email || 'Admin',
+      timestamp: new Date(),
+      reason: req.body?.reason || 'Question recovered: compiler & test-case validation passed successfully.',
+      previousStatus: 'flagged',
+      newStatus: 'tested',
+      details: validation
+    });
+
+    await doc.save();
+    const counts = await calculateCourseQuestionCounts(doc.courseId, doc.domain);
+
+    return res.json({
+      success: true,
+      message: 'Question successfully recovered and verified by compiler.',
+      data: doc,
+      counts
+    });
+  } catch (err) {
+    console.error('recoverQuestion error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────
+// POST /api/admin/syllabus/question/:type/:id/override
+// Admin manual override for non-technical flags with full audit history
+// ─────────────────────────────────────────────────────────
+exports.overrideQuestion = async (req, res) => {
+  try {
+    const { type, id } = req.params;
+    const { reason } = req.body;
+
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'A mandatory override reason must be provided by the administrator.'
+      });
+    }
+
+    let doc = null;
+    if (type === 'interview' || type === 'mock' || type === 'question') {
+      doc = await InterviewQuestion.findById(id);
+    } else if (type === 'task' || type === 'testing') {
+      doc = await DomainTask.findById(id);
+    }
+
+    if (!doc) {
+      return res.status(404).json({ success: false, message: 'Question not found.' });
+    }
+
+    const previousStatus = doc.verificationStatus || 'flagged';
+
+    // Set manual override status
+    doc.verificationStatus = 'verified';
+    doc.manualReviewStatus = 'OVERRIDDEN';
+    // NOTE: per spec, admin override must never falsely mark coding solution as compiler-verified.
+    // doc.isTested remains untouched.
+
+    if (!Array.isArray(doc.auditHistory)) doc.auditHistory = [];
+    doc.auditHistory.push({
+      action: 'ADMIN_OVERRIDE',
+      performedBy: req.user?._id || null,
+      performedByName: req.user?.name || req.user?.email || 'Admin',
+      timestamp: new Date(),
+      reason: reason.trim(),
+      previousStatus,
+      newStatus: 'verified',
+      details: {
+        note: 'Manual administrative override applied. Compiler status not falsely altered.'
+      }
+    });
+
+    await doc.save();
+    const counts = await calculateCourseQuestionCounts(doc.courseId, doc.domain);
+
+    return res.json({
+      success: true,
+      message: 'Administrative override recorded in audit history.',
+      data: doc,
+      counts
+    });
+  } catch (err) {
+    console.error('overrideQuestion error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────
+// GET /api/admin/syllabus/flagged-questions/:courseId
+// Returns strictly flagged questions for deep review & recovery
+// ─────────────────────────────────────────────────────────
+exports.getFlaggedQuestions = async (req, res) => {
+  try {
+    const { courseId } = req.params;
+    const { moduleId, topic, difficulty, questionType, flagReason, search } = req.query;
+
+    let filter = { verificationStatus: 'flagged', isActive: true };
+
+    if (courseId !== 'overall') {
+      const course = await Course.findById(courseId);
+      if (course) {
+        const domainKey = (course.slug || course.title).toLowerCase().replace(/[^a-z0-9]/g, '');
+        filter.$or = [{ courseId: course._id }, { domain: domainKey }];
+      } else {
+        filter.courseId = courseId;
+      }
+    }
+
+    if (moduleId && mongoose.Types.ObjectId.isValid(moduleId)) {
+      filter.moduleId = moduleId;
+    }
+    if (topic && topic !== 'all') {
+      filter.topic = new RegExp(topic, 'i');
+    }
+    if (difficulty && difficulty !== 'all') {
+      filter.difficulty = difficulty;
+    }
+
+    const [tasks, questions] = await Promise.all([
+      DomainTask.find(filter)
+        .populate('moduleId', 'title order')
+        .populate('courseId', 'title slug')
+        .sort({ updatedAt: -1 })
+        .lean(),
+      InterviewQuestion.find(filter)
+        .populate('moduleId', 'title order')
+        .populate('courseId', 'title slug')
+        .sort({ updatedAt: -1 })
+        .lean()
+    ]);
+
+    let combined = [
+      ...tasks.map(t => ({
+        ...t,
+        itemType: 'task',
+        categoryLabel: 'Testing & Practice',
+        targetFeature: 'TESTING_PRACTICE'
+      })),
+      ...questions.map(q => ({
+        ...q,
+        itemType: 'interview',
+        categoryLabel: q.targetFeature === 'MOCK_INTERVIEW' ? 'Mock Interview' : 'Interview Arena'
+      }))
+    ];
+
+    if (questionType && questionType !== 'all') {
+      combined = combined.filter(q => {
+        const qType = String(q.questionType || q.taskType || 'coding').toLowerCase();
+        return qType === questionType.toLowerCase();
+      });
+    }
+
+    if (flagReason && flagReason !== 'all') {
+      combined = combined.filter(q => {
+        return (q.flagReason || '').toLowerCase().includes(flagReason.toLowerCase());
+      });
+    }
+
+    if (search && search.trim()) {
+      const s = search.trim().toLowerCase();
+      combined = combined.filter(q => {
+        return (
+          (q.title || '').toLowerCase().includes(s) ||
+          (q.problemStatement || '').toLowerCase().includes(s) ||
+          (q.flagReason || '').toLowerCase().includes(s) ||
+          (q.topic || '').toLowerCase().includes(s)
+        );
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        totalFlagged: combined.length,
+        questions: combined
+      }
+    });
+  } catch (err) {
+    console.error('getFlaggedQuestions error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────
 // 19. PATCH /api/admin/syllabus/question/:type/:id/verification
-// Approve, verify, or flag questions
+// Approve, verify, or flag questions with audit log
 // ─────────────────────────────────────────────────────────
 exports.updateVerificationStatus = async (req, res) => {
   try {
     const { type, id } = req.params;
-    const { status } = req.body; // 'verified' | 'tested' | 'flagged' | 'pending'
+    const { status, reason } = req.body; // 'verified' | 'tested' | 'flagged' | 'pending'
 
     if (!['verified', 'tested', 'flagged', 'pending'].includes(status)) {
       return res.status(400).json({ success: false, message: 'Invalid verification status.' });
     }
 
-    let updatedDoc = null;
-    if (type === 'interview' || type === 'mock') {
-      updatedDoc = await InterviewQuestion.findByIdAndUpdate(id, { verificationStatus: status }, { new: true });
-    } else if (type === 'game') {
-      updatedDoc = await Challenge.findByIdAndUpdate(id, { verificationStatus: status }, { new: true });
+    let doc = null;
+    if (type === 'interview' || type === 'mock' || type === 'question') {
+      doc = await InterviewQuestion.findById(id);
     } else if (type === 'task' || type === 'testing') {
-      updatedDoc = await DomainTask.findByIdAndUpdate(id, { verificationStatus: status }, { new: true });
+      doc = await DomainTask.findById(id);
     }
 
-    if (!updatedDoc) {
+    if (!doc) {
       return res.status(404).json({ success: false, message: 'Record not found.' });
     }
+
+    const previousStatus = doc.verificationStatus || 'verified';
+    doc.verificationStatus = status;
+    if (status === 'flagged') {
+      doc.flagReason = reason || 'Flagged manually by administrator.';
+      doc.flaggedAt = new Date();
+      doc.isTested = false;
+    } else if (status === 'verified') {
+      doc.flagReason = '';
+    }
+
+    if (!Array.isArray(doc.auditHistory)) doc.auditHistory = [];
+    doc.auditHistory.push({
+      action: status === 'flagged' ? 'FLAG' : 'REVALIDATE',
+      performedBy: req.user?._id || null,
+      performedByName: req.user?.name || req.user?.email || 'Admin',
+      timestamp: new Date(),
+      reason: reason || `Status changed from ${previousStatus} to ${status}.`,
+      previousStatus,
+      newStatus: status
+    });
+
+    await doc.save();
+    const counts = await calculateCourseQuestionCounts(doc.courseId, doc.domain);
 
     return res.json({
       success: true,
       message: `Status updated to "${status}".`,
-      data: updatedDoc
+      data: doc,
+      counts
     });
   } catch (err) {
     console.error('updateVerificationStatus error:', err);
@@ -1467,11 +1845,6 @@ exports.publishCourseQuestions = async (req, res) => {
       { $set: { isActive: true } }
     );
 
-    const cRes = await Challenge.updateMany(
-      { $or: [{ courseId: course._id }, { domain: domainKey }], verificationStatus: { $ne: 'flagged' } },
-      { $set: { isActive: true } }
-    );
-
     const tRes = await DomainTask.updateMany(
       { $or: [{ courseId: course._id }, { domain: domainKey }], verificationStatus: { $ne: 'flagged' } },
       { $set: { isActive: true, isEnabled: true } }
@@ -1482,7 +1855,6 @@ exports.publishCourseQuestions = async (req, res) => {
       message: `Successfully published all verified questions for ${course.title} to students!`,
       data: {
         interviewQuestionsPublished: qRes.modifiedCount,
-        challengesPublished: cRes.modifiedCount,
         tasksPublished: tRes.modifiedCount
       }
     });
@@ -1518,29 +1890,22 @@ exports.getSyllabusCoverageReport = async (req, res) => {
 exports.syncSyllabusCoverage = async (req, res) => {
   try {
     const { courseId } = req.body;
-    const { generateAllSyllabusQuestionBanks, generateSyllabusCoverageReport } = require('../services/syllabusQuestionSeederService');
+    const { generateSyllabusCoverageReport } = require('../services/syllabusQuestionSeederService');
+    const { auditAndRepairAllCourses } = require('../services/syllabusAuditAndRepairService');
 
-    let coursesToSync = [];
-    if (courseId) {
-      const c = await Course.findById(courseId);
-      if (c) coursesToSync.push(c);
-    } else {
-      coursesToSync = await Course.find({ isActive: true });
-    }
-
-    const results = [];
-    for (const c of coursesToSync) {
-      const resData = await generateAllSyllabusQuestionBanks(c._id);
-      results.push(resData);
-    }
+    const auditReport = await auditAndRepairAllCourses({
+      runSandbox: true,
+      regenerateMissing: true,
+      courseId: courseId || null
+    });
 
     const report = await generateSyllabusCoverageReport(courseId);
 
     return res.json({
       success: true,
-      message: `Successfully synchronized syllabus questions across ${coursesToSync.length} course(s).`,
+      message: `Successfully audited and synchronized syllabus questions across ${auditReport.coursesScanned} course(s).`,
       data: {
-        syncResults: results,
+        auditReport,
         report
       }
     });

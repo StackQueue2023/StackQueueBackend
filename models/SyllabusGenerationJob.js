@@ -16,9 +16,28 @@ const syllabusGenerationJobSchema = new mongoose.Schema({
     type: String,
     required: true
   },
+  jobType: {
+    type: String,
+    enum: ['syllabus_tasks', 'ai_questions', 'combined'],
+    default: 'combined'
+  },
+  syllabusText: {
+    type: String,
+    default: ''
+  },
+  tasksPerModule: {
+    type: Number,
+    default: 12
+  },
+  parsedModules: [{
+    order: { type: Number, default: 1 },
+    title: { type: String, default: '' },
+    description: { type: String, default: '' },
+    topics: [{ type: String }]
+  }],
   status: {
     type: String,
-    enum: ['pending', 'generating', 'completed', 'failed'],
+    enum: ['pending', 'generating', 'completed', 'failed', 'cancelled', 'partial'],
     default: 'pending',
     index: true
   },
@@ -39,8 +58,8 @@ const syllabusGenerationJobSchema = new mongoose.Schema({
   stats: {
     totalModules: { type: Number, default: 0 },
     completedModules: { type: Number, default: 0 },
+    failedModules: { type: Number, default: 0 },
     interviewArenaCount: { type: Number, default: 0 },
-    gameHubCount: { type: Number, default: 0 },
     mockInterviewCount: { type: Number, default: 0 },
     moduleQuestionsCount: { type: Number, default: 0 },
     testingPracticeCount: { type: Number, default: 0 },
@@ -59,11 +78,31 @@ const syllabusGenerationJobSchema = new mongoose.Schema({
     progress: { type: Number, default: 0 },
     questionsCount: { type: Number, default: 0 },
     testedCount: { type: Number, default: 0 },
-    error: { type: String, default: null }
+    error: { type: String, default: null },
+    completedAt: { type: Date, default: null }
   }],
   error: {
     type: String,
     default: null
+  },
+  lastErrorDetails: {
+    timestamp: { type: Date, default: null },
+    endpoint: { type: String, default: '' },
+    failedModuleId: { type: String, default: '' },
+    moduleOrder: { type: Number, default: null },
+    statusCode: { type: Number, default: null },
+    backendException: { type: String, default: '' },
+    aiProviderError: { type: String, default: '' },
+    stack: { type: String, default: '' }
+  },
+  retryCount: {
+    type: Number,
+    default: 0
+  },
+  recoveryStatus: {
+    type: String,
+    enum: ['none', 'recovering', 'resumed', 'completed_after_recovery'],
+    default: 'none'
   },
   startedAt: {
     type: Date,

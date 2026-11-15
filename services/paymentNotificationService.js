@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const PaymentReminderLog = require('../models/PaymentReminderLog');
+const StudentProfile = require('../models/StudentProfile');
 
 /**
  * Payment Notification Service
@@ -29,6 +30,12 @@ async function sendPaymentNotification({
   messageBody,
   isDummy = true
 }) {
+  if (studentId) {
+    const sp = await StudentProfile.findOne({ userId: studentId }).select('studentCategory studentType').lean();
+    if (sp && (sp.studentCategory === 'TRAINING_TEMPORARY' || sp.studentType === 'TRAINING_TEMPORARY')) {
+      return null;
+    }
+  }
   const reminderId = `REM-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 
   // Log in dev console

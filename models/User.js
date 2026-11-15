@@ -41,8 +41,14 @@ const userSchema = new mongoose.Schema({
   },
   studentType: {
     type: String,
-    enum: ['LMS', 'COLLEGE_TRAINING', 'INSTITUTE_TRAINING', 'BOTH'],
+    enum: ['LMS', 'COLLEGE_TRAINING', 'INSTITUTE_TRAINING', 'BOTH', 'TRAINING_TEMPORARY'],
     default: 'LMS',
+    index: true
+  },
+  studentCategory: {
+    type: String,
+    enum: ['REGULAR', 'TRAINING_TEMPORARY'],
+    default: 'REGULAR',
     index: true
   },
   trainingEligible: {

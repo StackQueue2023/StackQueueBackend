@@ -37,6 +37,14 @@ router.post('/:id/preview-pdf', authorize('admin'), upload.single('file'), batch
 // Append new/existing students into existing batch (admin)
 router.post('/:id/append-students', authorize('admin'), batchManagementController.appendStudentsToBatch);
 
+// Reset student temporary password (admin)
+router.post('/:id/students/:studentUserId/reset-password', authorize('admin'), batchManagementController.resetStudentPassword);
+
+// Edit student details (admin) - supports both PUT and PATCH
+router.put('/:id/students/:studentUserId', authorize('admin'), batchManagementController.updateBatchStudentDetails);
+router.patch('/:id/students/:studentUserId', authorize('admin'), batchManagementController.updateBatchStudentDetails);
+router.patch('/:id/students/:studentUserId/status', authorize('admin'), batchManagementController.toggleStudentStatus);
+
 // Unassign student from batch (admin)
 router.delete('/:id/students/:studentUserId', authorize('admin'), batchManagementController.removeStudentFromBatch);
 
@@ -49,8 +57,9 @@ router.get('/eligible-students', authorize('admin', 'trainer', 'tutor'), batchMa
 // List all batches (admin, trainer, tutor)
 router.get('/', authorize('admin', 'trainer', 'tutor'), batchManagementController.getBatches);
 
-// Get batch details with 8 tabs data (admin, trainer, tutor)
+// Get batch details with 8 tabs data (admin, trainer, tutor) - supports both /:id and /:id/details
 router.get('/:id/details', authorize('admin', 'trainer', 'tutor'), batchManagementController.getBatchDetails);
+router.get('/:id', authorize('admin', 'trainer', 'tutor'), batchManagementController.getBatchDetails);
 
 // Manually trigger PDF & email generation for a batch date (admin, trainer, tutor)
 router.post('/:id/generate-report', authorize('admin', 'trainer', 'tutor'), batchManagementController.generateManualReport);

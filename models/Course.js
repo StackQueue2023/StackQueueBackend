@@ -124,6 +124,19 @@ const courseSchema = new mongoose.Schema({
     type: Boolean,
     default: true
   },
+  hasCompiler: {
+    type: Boolean,
+    default: null
+  },
+  compilerLanguage: {
+    type: String,
+    default: ''
+  },
+  executionEnvironment: {
+    type: String,
+    enum: ['COMPILER', 'MCQ', 'AUTO'],
+    default: 'AUTO'
+  },
   syllabusText: {
     type: String,
     default: ''

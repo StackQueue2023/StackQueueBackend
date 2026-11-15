@@ -3,6 +3,7 @@ const router = express.Router();
 const paymentController = require('../controllers/paymentController');
 const { protect } = require('../middleware/auth');
 const { authorize } = require('../middleware/rbac');
+const { requireRegularStudent } = require('../middleware/studentCategoryGuard');
 
 // ── Admin Command Center: Category Operational Analytics ───────────────────
 router.get(
@@ -103,6 +104,7 @@ router.get(
 router.get(
   '/student/my-payments',
   protect,
+  requireRegularStudent,
   paymentController.getStudentMyPayments
 );
 
@@ -110,6 +112,7 @@ router.get(
 router.get(
   '/receipts/:receiptNumber',
   protect,
+  requireRegularStudent,
   paymentController.getReceiptDetail
 );
 

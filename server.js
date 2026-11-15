@@ -57,10 +57,19 @@ connectDB();
 
 const app = express();
 
+// Ensure Database Connection in Serverless / Cold-Start Environments
+app.use(async (req, res, next) => {
+  if (mongoose.connection.readyState !== 1) {
+    try {
+      await connectDB();
+    } catch (_) {}
+  }
+  next();
+});
 
 // Middleware
 app.use(cors({
-  origin: '*',
+  origin: true,
   credentials: true
 }));
 app.use(express.json({ limit: '10mb' }));
@@ -88,6 +97,28 @@ app.use((req, res, next) => {
   req.requestId = req.headers['x-request-id'] || `REQ-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
   res.setHeader('X-Request-Id', req.requestId);
   next();
+});
+
+// Root endpoint to verify server status from browser / Vercel
+app.get('/', (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: 'STACK QUEUE Backend API is running successfully.',
+    status: 'live',
+    timestamp: new Date().toISOString(),
+    endpoints: {
+      health: '/api/health',
+      monitoring: '/api/monitoring/system-health'
+    }
+  });
+});
+
+app.get('/api', (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: 'STACK QUEUE API Root',
+    status: 'online'
+  });
 });
 
 // Health Check with Database Status
@@ -153,6 +184,7 @@ app.get('/api/monitoring/system-health', (req, res) => {
 const { initBatchScheduler } = require('./services/batchReportScheduler');
 const { initLiveClassReminderScheduler } = require('./services/sessionReminderScheduler');
 const { initFeeReminderScheduler } = require('./services/feeReminderScheduler');
+const { initTrainingReportScheduler } = require('./services/trainingReportScheduler');
 
 // Serve static uploads
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
@@ -160,10 +192,10 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // Routes
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/student', require('./routes/studentRoutes'));
-app.use('/api/games', require('./routes/gameRoutes'));
 app.use('/api/challenges', require('./routes/challengeRoutes'));
 app.use('/api/trainer', require('./routes/trainerRoutes'));
 app.use('/api/admin/batches', require('./routes/batchRoutes'));
+app.use('/api/admin/departments', require('./routes/departmentRoutes'));
 app.use('/api/admin/tutors', require('./routes/adminTutorRoutes'));
 app.use('/api/admin/offers', require('./routes/offerRoutes'));
 app.use('/api/tutors/email', require('./routes/tutorEmailRoutes'));
@@ -188,11 +220,16 @@ app.use('/api/admin/analytics', require('./routes/adminAnalyticsRoutes'));
 app.use('/api/announcements', require('./routes/announcementRoutes'));
 app.use('/api/tutor/progress', require('./routes/tutorProgressRoutes'));
 app.use('/api/monitoring', require('./routes/monitoringRoutes'));
+app.use('/api/training-management', require('./routes/trainingManagementRoutes'));
+app.use('/api/college-financial', require('./routes/collegeFinancialRoutes'));
+app.use('/api/adaptive-questions', require('./routes/adaptiveQuestionRoutes'));
+app.use('/api', require('./routes/collegeTrainingSyllabusRoutes'));
 
 // Start schedulers
 initBatchScheduler();
 initLiveClassReminderScheduler();
 initFeeReminderScheduler();
+initTrainingReportScheduler();
 
 // 404 handler
 app.use((req, res) => {
@@ -248,53 +285,71 @@ app.use((err, req, res, _next) => {
 });
 
 const PORT = process.env.PORT || 5000;
-const server = app.listen(PORT, () => {
-  systemLogger.info(`[STACK QUEUE API] Server listening on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode (PID: ${process.pid})`);
-});
+let server = null;
 
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    systemLogger.warn(`[Port Conflict] Port ${PORT} is temporarily busy. Retrying in 2 seconds...`);
-    setTimeout(() => {
-      try {
-        server.close();
-      } catch (_) {}
-      server.listen(PORT);
-    }, 2000);
-  } else {
-    systemLogger.fatal(`[Server Listen Error]: ${err.message}`, { stack: err.stack });
-  }
-});
+// Only listen locally or in standard VM/container environments. In Vercel serverless functions, export app directly.
+if (!process.env.VERCEL) {
+  server = app.listen(PORT, () => {
+    systemLogger.info(`[STACK QUEUE API] Server listening on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode (PID: ${process.pid})`);
 
-// Graceful Manual Stop Handling (Stops ONLY on explicit manual termination)
-let isShuttingDown = false;
-const gracefulShutdown = (signal) => {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
-  systemLogger.info(`[Process] Manual stop signal (${signal}) received. Commencing graceful shutdown...`);
+    // Configure resilient HTTP timeouts
+    server.keepAliveTimeout = 120000;
+    server.headersTimeout = 125000;
+    server.requestTimeout = 300000;
 
-  // Close HTTP server to stop accepting new requests
-  server.close(() => {
-    systemLogger.info('[Process] HTTP server closed gracefully.');
-
-    // Close MongoDB connection cleanly
-    mongoose.connection.close(false).then(() => {
-      systemLogger.info('[Process] MongoDB connections closed. Terminating process cleanly with code 0.');
-      process.exit(0);
-    }).catch((dbErr) => {
-      systemLogger.warn(`[Process] DB close warning during shutdown: ${dbErr.message}`);
-      process.exit(0);
-    });
+    // Run startup recovery for any orphaned/stalled generation jobs
+    try {
+      const { autoRecoverStalledJobs } = require('./services/syllabusBackgroundJobService');
+      autoRecoverStalledJobs().catch(() => {});
+    } catch (_) {}
   });
 
-  // Force kill if graceful close hangs beyond 5 seconds
-  setTimeout(() => {
-    systemLogger.warn('[Process] Shutdown exceeded 5s timeout. Forcing exit.');
-    process.exit(0);
-  }, 5000).unref();
-};
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      systemLogger.warn(`[Port Conflict] Port ${PORT} is temporarily busy. Retrying in 2 seconds...`);
+      setTimeout(() => {
+        try {
+          server.close();
+        } catch (_) {}
+        server.listen(PORT);
+      }, 2000);
+    } else {
+      systemLogger.fatal(`[Server Listen Error]: ${err.message}`, { stack: err.stack });
+    }
+  });
 
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  // Graceful Manual Stop Handling (Stops ONLY on explicit manual termination)
+  let isShuttingDown = false;
+  const gracefulShutdown = (signal) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    systemLogger.info(`[Process] Manual stop signal (${signal}) received. Commencing graceful shutdown...`);
 
-module.exports = { app, server };
+    // Close HTTP server to stop accepting new requests
+    server.close(() => {
+      systemLogger.info('[Process] HTTP server closed gracefully.');
+
+      // Close MongoDB connection cleanly
+      mongoose.connection.close(false).then(() => {
+        systemLogger.info('[Process] MongoDB connections closed. Terminating process cleanly with code 0.');
+        process.exit(0);
+      }).catch((dbErr) => {
+        systemLogger.warn(`[Process] DB close warning during shutdown: ${dbErr.message}`);
+        process.exit(0);
+      });
+    });
+
+    // Force kill if graceful close hangs beyond 5 seconds
+    setTimeout(() => {
+      systemLogger.warn('[Process] Shutdown exceeded 5s timeout. Forcing exit.');
+      process.exit(0);
+    }, 5000).unref();
+  };
+
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+}
+
+module.exports = app;
+module.exports.app = app;
+module.exports.server = server;

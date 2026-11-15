@@ -132,6 +132,138 @@ const batchSchema = new mongoose.Schema({
   averageScore: {
     type: Number,
     default: 0
+  },
+  // --- FINANCIAL & EXTENDED COLLEGE TRAINING CONFIGURATION ---
+  pricingModel: {
+    type: String,
+    enum: ['PER_STUDENT', 'PER_DAY'],
+    default: 'PER_STUDENT'
+  },
+  ratePerStudent: {
+    type: Number,
+    default: 2000
+  },
+  ratePerDay: {
+    type: Number,
+    default: 5000
+  },
+  actualTrainingDays: {
+    type: Number,
+    default: 0
+  },
+  expectedCollegeRevenue: {
+    type: Number,
+    default: 0
+  },
+  totalCollegeReceived: {
+    type: Number,
+    default: 0
+  },
+  collegePendingAmount: {
+    type: Number,
+    default: 0
+  },
+  collegePaymentStatus: {
+    type: String,
+    enum: ['Not Received', 'Partially Received', 'Fully Received', 'Overdue'],
+    default: 'Not Received'
+  },
+  collegePaymentDueDate: {
+    type: Date
+  },
+  collegeLastPaymentDate: {
+    type: Date
+  },
+  // Multi-trainer assignment with independent rates and payments
+  assignedTrainers: [{
+    trainerId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    },
+    name: { type: String, default: '' },
+    email: { type: String, default: '' },
+    phone: { type: String, default: '' },
+    domain: { type: String, default: '' },
+    paymentModel: {
+      type: String,
+      enum: ['FIXED', 'PER_DAY'],
+      default: 'PER_DAY'
+    },
+    rate: { type: Number, default: 0 },
+    assignedDays: { type: Number, default: 0 },
+    totalPayment: { type: Number, default: 0 },
+    amountReleased: { type: Number, default: 0 },
+    pendingAmount: { type: Number, default: 0 },
+    paymentStatus: {
+      type: String,
+      enum: ['Not Released', 'Partially Released', 'Fully Paid'],
+      default: 'Not Released'
+    },
+    dueDate: { type: Date },
+    lastPaymentDate: { type: Date },
+    assignedDates: [{ type: Date }]
+  }],
+  totalTrainerPayment: {
+    type: Number,
+    default: 0
+  },
+  totalTrainerReleased: {
+    type: Number,
+    default: 0
+  },
+  trainerPaymentPending: {
+    type: Number,
+    default: 0
+  },
+  trainerPaymentStatus: {
+    type: String,
+    enum: ['Not Released', 'Partially Released', 'Fully Paid'],
+    default: 'Not Released'
+  },
+  // Scheduled training days (for day-based calculations and sessions)
+  scheduledDays: [{
+    dayNumber: { type: Number },
+    date: { type: Date },
+    morningTopic: { type: String, default: '' },
+    afternoonTopic: { type: String, default: '' },
+    trainerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    trainerName: { type: String, default: '' },
+    status: {
+      type: String,
+      enum: ['Scheduled', 'Completed', 'Cancelled', 'Rescheduled'],
+      default: 'Scheduled'
+    },
+    isHoliday: { type: Boolean, default: false }
+  }],
+  // Other training expenses (travel, stay, food, materials, other)
+  expenses: [{
+    expenseId: { type: String },
+    category: {
+      type: String,
+      enum: ['Travel', 'Accommodation', 'Food', 'Training Materials', 'Other'],
+      default: 'Other'
+    },
+    amount: { type: Number, default: 0 },
+    date: { type: Date, default: Date.now },
+    description: { type: String, default: '' },
+    paymentStatus: {
+      type: String,
+      enum: ['Pending', 'Paid'],
+      default: 'Paid'
+    },
+    receiptUrl: { type: String, default: '' }
+  }],
+  totalExpenses: {
+    type: Number,
+    default: 0
+  },
+  estimatedProfit: {
+    type: Number,
+    default: 0
+  },
+  actualCashBalance: {
+    type: Number,
+    default: 0
   }
 }, { timestamps: true });
 

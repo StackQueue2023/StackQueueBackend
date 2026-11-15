@@ -10,7 +10,7 @@ const StudentProfile = require('../models/StudentProfile');
 const DailyChallengeHistory = require('../models/DailyChallengeHistory');
 const { selectUniqueDailyChallenge } = require('../services/questionRegistryService');
 const { evaluateCode } = require('../services/interviewCodeRunner');
-const { awardXp } = require('../services/xpEngine');
+const { awardXp, awardQuestionXpIdempotent } = require('../services/xpEngine');
 const { logAction } = require('../services/auditLogger');
 const { getStudentAllowedLanguages, validateStudentLanguageAccess } = require('../utils/studentLanguageValidator');
 const { getDomainCompilerConfig, getStarterCodeForLanguage } = require('../utils/domainCompilerMapping');
@@ -553,45 +553,60 @@ exports.submitSolution = async (req, res) => {
     }
 
     let xpAwarded = 0;
+    let xpResult = null;
     let unlockedNextLevel = false;
 
     if (evalResult.allPassed && !alreadySolved) {
       // Base XP
-      xpAwarded = question.xp || 10;
+      let plannedXp = question.xp || 10;
 
       // Check if this question is today's active Daily Challenge
       const todayStr = new Date().toISOString().split('T')[0];
       const isDailyBonusDoc = await DailyQuestionLog.findOne({ date: todayStr, question: question._id });
       let isDailyBonus = false;
       if (isDailyBonusDoc) {
-        xpAwarded += 20; // Extra +20 Bonus XP for solving Daily Challenge!
+        plannedXp += 20; // Extra +20 Bonus XP for solving Daily Challenge!
         isDailyBonus = true;
       }
 
       // First attempt bonus
       if (previousAttempts === 0) {
-        xpAwarded += 10;
+        plannedXp += 10;
       }
 
       // No hints used bonus
       if (Number(hintsUsed) === 0) {
-        xpAwarded += 5;
+        plannedXp += 5;
       }
 
-      // Award XP into user gamification engine
-      await awardXp(
-        studentId,
-        xpAwarded,
-        isDailyBonus ? 'daily_challenge_solved' : 'challenge_solved',
-        question._id,
-        'InterviewQuestion',
-        isDailyBonus
-          ? `Solved Daily Challenge Q${question.questionNumber}: ${question.title} (+20 Bonus XP)`
-          : `Solved Interview Q${question.questionNumber}: ${question.title}`
-      );
+      const featureName = isDailyBonus
+        ? 'DAILY_CHALLENGE'
+        : (question.targetFeature || 'INTERVIEW_ARENA');
+      const reasonMap = {
+        DAILY_CHALLENGE: 'daily_challenge_solved',
+        MOCK_INTERVIEW: 'mock_interview_solved',
+        MODULE_QUESTIONS: 'module_question_solved',
+        INTERVIEW_ARENA: 'interview_arena_solved'
+      };
 
-      // Update InterviewProgress
-      const progress = await getOrCreateProgress(studentId);
+      // Award XP idempotently through centralized engine
+      xpResult = await awardQuestionXpIdempotent({
+        studentUserId: studentId,
+        questionId: question._id,
+        feature: featureName,
+        amount: plannedXp,
+        reason: reasonMap[featureName] || 'interview_arena_solved',
+        referenceId: question._id,
+        referenceModel: 'InterviewQuestion',
+        description: isDailyBonus
+          ? `Solved Daily Challenge Q${question.questionNumber}: ${question.title} (+20 Bonus XP)`
+          : `Solved ${featureName.replace(/_/g, ' ')} Q${question.questionNumber}: ${question.title}`
+      });
+      xpAwarded = xpResult?.xpAwarded || 0;
+
+      // Update InterviewProgress only if first pass
+      if (xpResult?.awarded) {
+        const progress = await getOrCreateProgress(studentId);
       progress.solvedQuestions.push({
         questionId: question._id,
         questionNumber: question.questionNumber,
@@ -624,9 +639,14 @@ exports.submitSolution = async (req, res) => {
       }
 
       progress.totalAttempts += 1;
-      await progress.save();
+        await progress.save();
+      } else {
+        const progress = await getOrCreateProgress(studentId);
+        progress.totalAttempts += 1;
+        await progress.save();
+      }
     } else {
-      // Record failed attempt in progress stats
+      // Record failed or repeat attempt in progress stats
       const progress = await getOrCreateProgress(studentId);
       progress.totalAttempts += 1;
       await progress.save();
@@ -675,8 +695,18 @@ exports.submitSolution = async (req, res) => {
       isTrackCompleted = nextInfo.isTrackCompleted;
     }
 
+    const currentProfile = xpResult && xpResult.totalXp !== undefined
+      ? { totalXp: xpResult.totalXp, currentLevel: xpResult.level }
+      : await StudentProfile.findOne({ userId: studentId }).select('totalXp currentLevel').lean();
+
+    const alreadyCompleted = Boolean(evalResult.allPassed && (alreadySolved || xpResult?.alreadyCompleted));
+
     return res.json({
       success: true,
+      totalXp: currentProfile?.totalXp ?? 0,
+      xpAwarded,
+      alreadyCompleted,
+      level: currentProfile?.currentLevel ?? null,
       data: {
         submissionId: submission._id,
         status,
@@ -686,6 +716,9 @@ exports.submitSolution = async (req, res) => {
         executionTimeMs: evalResult.executionTimeMs,
         testResults: safeResults,
         xpAwarded,
+        alreadyCompleted,
+        totalXp: currentProfile?.totalXp ?? 0,
+        level: currentProfile?.currentLevel ?? null,
         unlockedNextLevel,
         attemptNumber: previousAttempts + 1,
         nextQuestion,
@@ -1137,8 +1170,56 @@ exports.submitMockInterview = async (req, res) => {
 
     await session.save();
 
+    let mockXpAwarded = 0;
+    let totalXp = null;
+    let level = null;
+    let anyAlreadyCompleted = false;
+
+    if (req.user && req.user._id) {
+      const qXpMap = new Map();
+      (session.questionIds || []).forEach(q => {
+        if (q && q._id) qXpMap.set(q._id.toString(), q.xp || 10);
+      });
+
+      for (const r of results) {
+        if (!r || !r.passed || !r.questionId) continue;
+        const amount = qXpMap.get(r.questionId.toString()) || 10;
+        const xpRes = await awardQuestionXpIdempotent({
+          studentUserId: req.user._id,
+          questionId: r.questionId,
+          feature: 'MOCK_INTERVIEW',
+          amount,
+          reason: 'mock_interview_solved',
+          referenceId: r.questionId,
+          referenceModel: 'InterviewQuestion',
+          description: `Solved Mock Interview Q: ${r.title || r.questionNumber || r.questionId}`
+        });
+        if (xpRes.awarded) {
+          mockXpAwarded += xpRes.xpAwarded || 0;
+        } else if (xpRes.alreadyCompleted) {
+          anyAlreadyCompleted = true;
+        }
+        if (xpRes.totalXp !== undefined && xpRes.totalXp !== null) {
+          totalXp = xpRes.totalXp;
+          level = xpRes.level;
+        }
+      }
+
+      if (totalXp === null) {
+        const curProfile = await StudentProfile.findOne({ userId: req.user._id }).select('totalXp currentLevel').lean();
+        totalXp = curProfile?.totalXp ?? 0;
+        level = curProfile?.currentLevel ?? null;
+      }
+    }
+
+    const alreadyCompleted = Boolean(passedCount > 0 && mockXpAwarded === 0 && anyAlreadyCompleted);
+
     return res.json({
       success: true,
+      totalXp,
+      xpAwarded: mockXpAwarded,
+      alreadyCompleted,
+      level,
       data: {
         sessionId: session._id,
         score,
@@ -1149,7 +1230,11 @@ exports.submitMockInterview = async (req, res) => {
         timeSpentSeconds,
         durationMinutes: session.durationMinutes,
         stats: session.stats,
-        results
+        results,
+        xpAwarded: mockXpAwarded,
+        alreadyCompleted,
+        totalXp,
+        level
       }
     });
   } catch (error) {

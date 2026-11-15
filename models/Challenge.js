@@ -153,6 +153,15 @@ const challengeSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  topicId: {
+    type: String,
+    default: '',
+    index: true
+  },
+  testingSolution: {
+    type: String,
+    default: ''
+  },
   domain: {
     type: String,
     default: 'general',

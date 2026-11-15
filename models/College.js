@@ -36,6 +36,26 @@ const collegeSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  hodName: {
+    type: String,
+    default: ''
+  },
+  hodEmail: {
+    type: String,
+    trim: true,
+    lowercase: true,
+    default: ''
+  },
+  placementOfficerName: {
+    type: String,
+    default: ''
+  },
+  placementOfficerEmail: {
+    type: String,
+    trim: true,
+    lowercase: true,
+    default: ''
+  },
   isActive: {
     type: Boolean,
     default: true

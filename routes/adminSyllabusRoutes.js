@@ -51,7 +51,14 @@ router.post('/generate-questions/:courseId', syllabusController.triggerGenerateC
 router.post('/generate-all-domains', syllabusController.triggerGenerateAllDomains);
 router.post('/regenerate-topic', syllabusController.regenerateTopic);
 router.post('/retry-generation/:jobId', syllabusController.retryGeneration);
+router.post('/resume-job/:jobId', syllabusController.retryGeneration);
+router.post('/cancel-job/:jobId', syllabusController.cancelJob);
 router.put('/question/:type/:id', syllabusController.updateQuestion);
+router.delete('/question/:type/:id', syllabusController.deleteQuestion);
+router.post('/question/:type/:id/revalidate', syllabusController.revalidateQuestion);
+router.post('/question/:type/:id/recover', syllabusController.recoverQuestion);
+router.post('/question/:type/:id/override', syllabusController.overrideQuestion);
+router.get('/flagged-questions/:courseId', syllabusController.getFlaggedQuestions);
 router.patch('/question/:type/:id/verification', syllabusController.updateVerificationStatus);
 router.post('/publish-questions/:courseId', syllabusController.publishCourseQuestions);
 

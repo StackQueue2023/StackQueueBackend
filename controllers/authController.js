@@ -45,7 +45,7 @@ exports.login = async (req, res) => {
       // Find associated student user
       const studentUser = await User.findById(courseEnrollment.studentId).select('+password');
       if (!studentUser || !studentUser.isActive) {
-        return res.status(401).json({ success: false, message: 'Student account not found or deactivated.' });
+        return res.status(401).json({ success: false, message: 'Invalid credentials.' });
       }
 
       let isMatch = false;
@@ -57,7 +57,7 @@ exports.login = async (req, res) => {
       }
 
       if (!isMatch) {
-        return res.status(401).json({ success: false, message: 'Invalid credentials. Password incorrect.' });
+        return res.status(401).json({ success: false, message: 'Invalid credentials.' });
       }
 
       const profile = await StudentProfile.findOne({ userId: studentUser._id })
@@ -97,12 +97,16 @@ exports.login = async (req, res) => {
     }).select('+password');
 
     if (!user) {
-      return res.status(401).json({ success: false, message: 'Invalid credentials. User not found.' });
+      return res.status(401).json({ success: false, message: 'Invalid credentials.' });
+    }
+
+    if (!user.isActive) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials.' });
     }
 
     const isMatch = await user.matchPassword(password);
     if (!isMatch) {
-      return res.status(401).json({ success: false, message: 'Invalid credentials. Password incorrect.' });
+      return res.status(401).json({ success: false, message: 'Invalid credentials.' });
     }
 
     let profile = null;
@@ -149,6 +153,7 @@ exports.login = async (req, res) => {
         username: user.username || user.email.split('@')[0],
         email: user.email,
         role: user.role,
+        studentCategory: user.studentCategory || profile?.studentCategory || 'REGULAR',
         avatar: user.avatar,
         phone: user.phone || ''
       },
@@ -373,6 +378,7 @@ exports.getMe = async (req, res) => {
         username: user.username || user.email.split('@')[0],
         email: user.email,
         role: user.role,
+        studentCategory: user.studentCategory || profile?.studentCategory || 'REGULAR',
         avatar: user.avatar,
         phone: user.phone || ''
       },

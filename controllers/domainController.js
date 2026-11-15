@@ -9,7 +9,7 @@ const InterviewQuestion = require('../models/InterviewQuestion');
 const InterviewTestCase = require('../models/InterviewTestCase');
 const InterviewSubmission = require('../models/InterviewSubmission');
 const { evaluateCode } = require('../services/interviewCodeRunner');
-const { awardXp } = require('../services/xpEngine');
+const { awardXp, awardQuestionXpIdempotent } = require('../services/xpEngine');
 const { validateStudentLanguageAccess } = require('../utils/studentLanguageValidator');
 
 // Domain code → slug mapping
@@ -431,19 +431,75 @@ exports.getModules = async (req, res) => {
     }
 
     const modules = await resolveCourseModules(activeCourse);
+    const moduleIds = modules.map(m => m._id);
 
-    const statuses = await StudentModuleStatus.find({ studentId: req.user._id });
+    const [statuses, domainTasks, completedDomainProgress, modQuestions] = await Promise.all([
+      StudentModuleStatus.find({ studentId: req.user._id }).lean(),
+      DomainTask.find({ moduleId: { $in: moduleIds }, isActive: true }).select('_id moduleId').lean(),
+      StudentDomainProgress.find({ studentId: req.user._id, moduleId: { $in: moduleIds }, status: 'completed' }).select('taskId moduleId').lean(),
+      InterviewQuestion.find({
+        moduleId: { $in: moduleIds },
+        $or: [{ targetFeature: 'MODULE_QUESTIONS' }, { targetFeature: 'MODULE' }, { questionBankType: 'MODULE' }],
+        isActive: true
+      }).select('_id moduleId').lean()
+    ]);
+
+    const modQuestionIds = modQuestions.map(q => q._id);
+    const solvedModQuestionIdList = modQuestionIds.length > 0
+      ? await InterviewSubmission.distinct('questionId', {
+          studentId: req.user._id,
+          questionId: { $in: modQuestionIds },
+          status: { $in: ['Accepted', 'PASSED'] }
+        })
+      : [];
+    const solvedModQuestionSet = new Set(solvedModQuestionIdList.map(id => id.toString()));
+
+    const dtTotalByMod = {};
+    domainTasks.forEach(t => {
+      const mId = t.moduleId.toString();
+      dtTotalByMod[mId] = (dtTotalByMod[mId] || 0) + 1;
+    });
+
+    const dtDoneSetByMod = {};
+    completedDomainProgress.forEach(p => {
+      const mId = p.moduleId.toString();
+      if (!dtDoneSetByMod[mId]) dtDoneSetByMod[mId] = new Set();
+      dtDoneSetByMod[mId].add(p.taskId.toString());
+    });
+
+    const mqTotalByMod = {};
+    const mqDoneByMod = {};
+    modQuestions.forEach(q => {
+      const mId = q.moduleId.toString();
+      mqTotalByMod[mId] = (mqTotalByMod[mId] || 0) + 1;
+      if (solvedModQuestionSet.has(q._id.toString())) {
+        mqDoneByMod[mId] = (mqDoneByMod[mId] || 0) + 1;
+      }
+    });
+
     const statusMap = {};
     statuses.forEach(s => { statusMap[s.moduleId.toString()] = s.status; });
 
     const modulesWithStatus = modules.map(mod => {
       const m = mod.toObject ? mod.toObject() : { ...mod };
+      const mId = mod._id.toString();
+      const totalModTasks = (dtTotalByMod[mId] || 0) + (mqTotalByMod[mId] || 0);
+      const completedModTasks = isCompletedCourse
+        ? totalModTasks
+        : ((dtDoneSetByMod[mId]?.size || 0) + (mqDoneByMod[mId] || 0));
+
+      m.totalTasks = totalModTasks;
+      m.completedTasks = Math.min(totalModTasks, completedModTasks);
+      m.progress = isCompletedCourse
+        ? 100
+        : (totalModTasks > 0 ? Math.min(100, Math.round((m.completedTasks / totalModTasks) * 100)) : 0);
+
       if (isCompletedCourse) {
         m.status = 'completed';
         m.isLocked = false;
       } else {
         const defaultStatus = mod.order === 1 ? 'processing' : 'not_started';
-        const s = statusMap[mod._id.toString()] || defaultStatus;
+        const s = statusMap[mId] || defaultStatus;
         m.status = s;
         m.isLocked = (s === 'not_started');
       }
@@ -784,20 +840,34 @@ exports.submitTask = async (req, res) => {
     }
 
     const wasAlreadyCompleted = progress.status === 'completed';
+    let xpResult = null;
+    let actualXpAwarded = 0;
 
     if (isCompleted) {
       progress.status = 'completed';
-      progress.completedAt = new Date();
+      progress.completedAt = progress.completedAt || new Date();
       progress.pointsEarned = earnedPoints;
       if (!wasAlreadyCompleted && earnedPoints > 0) {
-        await StudentProfile.findOneAndUpdate(
-          { userId: req.user._id },
-          { $inc: { totalXp: earnedPoints } }
-        );
+        xpResult = await awardQuestionXpIdempotent({
+          studentUserId: req.user._id,
+          questionId: task._id,
+          feature: 'DOMAIN_TASK',
+          amount: earnedPoints,
+          reason: 'challenge_solved',
+          referenceId: task._id,
+          referenceModel: 'DomainTask',
+          description: `Completed Domain Task: ${task.title || task._id}`
+        });
+        actualXpAwarded = xpResult?.xpAwarded || 0;
       }
     } else {
       progress.status = 'in_progress';
     }
+
+    const latestProfile = xpResult && xpResult.totalXp !== undefined
+      ? { totalXp: xpResult.totalXp, currentLevel: xpResult.level }
+      : await StudentProfile.findOne({ userId: req.user._id }).select('totalXp currentLevel').lean();
+    const alreadyCompleted = Boolean(isCompleted && (wasAlreadyCompleted || xpResult?.alreadyCompleted));
 
     progress.submission = {
       textAnswer: textAnswer || '',
@@ -822,10 +892,20 @@ exports.submitTask = async (req, res) => {
 
     return res.json({
       success: true,
-      message: isCompleted ? 'Challenge passed! Full points awarded.' : 'Some test cases failed. Please review your logic and try again.',
+      message: isCompleted
+        ? (alreadyCompleted ? 'Already completed! Solution verified.' : 'Challenge passed! Full points awarded.')
+        : 'Some test cases failed. Please review your logic and try again.',
+      xpAwarded: actualXpAwarded,
+      alreadyCompleted,
+      totalXp: latestProfile?.totalXp ?? 0,
+      level: latestProfile?.currentLevel ?? null,
       data: {
         status: progress.status,
         pointsEarned: progress.pointsEarned,
+        xpAwarded: actualXpAwarded,
+        alreadyCompleted,
+        totalXp: latestProfile?.totalXp ?? 0,
+        level: latestProfile?.currentLevel ?? null,
         allPassed: isCompleted,
         attemptCount: progress.attemptCount,
         evaluation
@@ -1040,33 +1120,57 @@ exports.submitModuleQuestion = async (req, res) => {
       };
     }
 
+    let xpResult = null;
+    let alreadySolvedBefore = false;
+
     if (allPassed) {
       const alreadySolved = await InterviewSubmission.findOne({
         studentId,
         questionId: question._id,
         status: { $in: ['Accepted', 'PASSED'] }
       });
+      alreadySolvedBefore = Boolean(alreadySolved);
 
       if (!alreadySolved) {
-        xpAwarded = question.xp || 20;
-        await awardXp(
-          studentId,
-          xpAwarded,
-          'module_question_solved',
-          question._id,
-          'InterviewQuestion',
-          `Solved Module Practice Q${question.questionNumber}: ${question.title}`
-        );
+        const plannedXp = question.xp || 20;
+        const featureName = question.targetFeature || 'MODULE_QUESTIONS';
+        const reasonMap = {
+          DAILY_CHALLENGE: 'daily_challenge_solved',
+          MOCK_INTERVIEW: 'mock_interview_solved',
+          INTERVIEW_ARENA: 'interview_arena_solved',
+          MODULE_QUESTIONS: 'module_question_solved'
+        };
+        xpResult = await awardQuestionXpIdempotent({
+          studentUserId: studentId,
+          questionId: question._id,
+          feature: featureName,
+          amount: plannedXp,
+          reason: reasonMap[featureName] || 'module_question_solved',
+          referenceId: question._id,
+          referenceModel: 'InterviewQuestion',
+          description: `Solved Module Practice Q${question.questionNumber}: ${question.title}`
+        });
+        xpAwarded = xpResult?.xpAwarded || 0;
       }
     }
+
+    const latestProfile = xpResult && xpResult.totalXp !== undefined
+      ? { totalXp: xpResult.totalXp, currentLevel: xpResult.level }
+      : await StudentProfile.findOne({ userId: studentId }).select('totalXp currentLevel').lean();
+    const alreadyCompleted = Boolean(allPassed && (alreadySolvedBefore || xpResult?.alreadyCompleted));
+
+    const allowedLang = ['javascript', 'python', 'java'].includes((language || '').toLowerCase())
+      ? (language || '').toLowerCase()
+      : 'javascript';
+    const submissionStatus = allPassed ? 'PASSED' : 'FAILED';
 
     const submission = await InterviewSubmission.create({
       studentId,
       questionId: question._id,
       questionNumber: question.questionNumber,
-      language: language || (isCoding ? 'javascript' : 'theory'),
-      code: isCoding ? (code || '') : (answer || code || ''),
-      status: verdict,
+      language: allowedLang,
+      code: (isCoding ? (code || '') : (answer || code || '')) || '// submitted',
+      status: submissionStatus,
       passedTests: evalResult ? evalResult.passedTests : 0,
       totalTests: evalResult ? evalResult.totalTests : 0,
       testResults: evalResult ? evalResult.testResults : [],
@@ -1089,10 +1193,17 @@ exports.submitModuleQuestion = async (req, res) => {
       verdict,
       allPassed,
       xpAwarded,
+      alreadyCompleted,
+      totalXp: latestProfile?.totalXp ?? 0,
+      level: latestProfile?.currentLevel ?? null,
       data: {
         submissionId: submission._id,
         status: verdict,
         allPassed,
+        xpAwarded,
+        alreadyCompleted,
+        totalXp: latestProfile?.totalXp ?? 0,
+        level: latestProfile?.currentLevel ?? null,
         passedTests: evalResult ? evalResult.passedTests : 0,
         totalTests: evalResult ? evalResult.totalTests : 0,
         executionTimeMs: evalResult ? evalResult.executionTimeMs : 0,

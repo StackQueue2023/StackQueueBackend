@@ -4,7 +4,7 @@ const Progress = require('../models/Progress');
 const StudentProfile = require('../models/StudentProfile');
 const DailyChallenge = require('../models/DailyChallenge');
 const ChallengeHistory = require('../models/ChallengeHistory');
-const { awardXp } = require('../services/xpEngine');
+const { awardXp, awardQuestionXpIdempotent } = require('../services/xpEngine');
 const { evaluateCss } = require('../services/cssEvaluator');
 const { executeSqlQuery } = require('../services/sqlSandbox');
 const { runTestCases, executeJavaScript, normalizeOutput } = require('../services/executionSandbox');
@@ -279,26 +279,44 @@ exports.submitChallenge = async (req, res) => {
 
     xpEarned = baseXp + bonusXp;
 
+    let awardedResult = null;
+    const alreadyCompletedBefore = Boolean(alreadyPassed);
+    if (!alreadyCompletedBefore && xpEarned > 0) {
+      awardedResult = await awardQuestionXpIdempotent({
+        studentUserId,
+        questionId: challenge._id,
+        feature: 'GAME_HUB',
+        amount: xpEarned,
+        reason: 'challenge_solved',
+        referenceId: challenge._id,
+        referenceModel: 'Challenge',
+        description: `Solved ${challenge.title} in ${challenge.gameSlug}`
+      });
+      xpEarned = awardedResult.xpAwarded || 0;
+    } else {
+      xpEarned = 0;
+      const curProfile = await StudentProfile.findOne({ userId: studentUserId }).select('totalXp currentLevel').lean();
+      awardedResult = {
+        awarded: false,
+        alreadyCompleted: alreadyCompletedBefore,
+        xpAwarded: 0,
+        totalXp: curProfile?.totalXp ?? 0,
+        level: curProfile?.currentLevel ?? null,
+        leveledUp: false
+      };
+    }
+
     // Update student profile stats
     const profile = await StudentProfile.findOne({ userId: studentUserId });
     if (profile) {
-      if (!alreadyPassed) {
+      if (!alreadyCompletedBefore) {
         profile.stats.challengesSolved += 1;
       }
       profile.stats.totalAttempts += 1;
       await profile.save();
     }
 
-    // Award XP through centralized engine
-    const awardResult = await awardXp(
-      studentUserId,
-      xpEarned,
-      'challenge_solved',
-      challenge._id,
-      'Challenge',
-      `Solved ${challenge.title} in ${challenge.gameSlug}`
-    );
-    levelInfo = awardResult;
+    levelInfo = awardedResult;
 
     // Update Game Progress
     let progress = await Progress.findOne({ studentId: studentUserId, gameSlug: challenge.gameSlug });
@@ -379,6 +397,10 @@ exports.submitChallenge = async (req, res) => {
       score: 100,
       feedback: '✓ Challenge Completed Successfully!',
       xpEarned,
+      xpAwarded: xpEarned,
+      alreadyCompleted: Boolean(levelInfo?.alreadyCompleted ?? alreadyPassed),
+      totalXp: levelInfo?.totalXp ?? 0,
+      level: levelInfo?.level ?? null,
       stars,
       levelInfo,
       unlockedNextLevel,
@@ -441,7 +463,42 @@ exports.submitDomainDailyChallenge = async (req, res) => {
       score = 70;
     }
 
-    const pointsEarned = passed ? (challenge.xpReward || 20) : 0;
+    const prevHistory = await ChallengeHistory.findOne({ studentId: req.user._id, challengeId }).lean();
+    const wasAlreadyCompleted = prevHistory?.completionStatus === 'completed';
+
+    const plannedPoints = passed && !wasAlreadyCompleted ? (challenge.xpReward || 20) : 0;
+
+    let xpResult;
+    if (passed && plannedPoints > 0) {
+      xpResult = await awardQuestionXpIdempotent({
+        studentUserId: req.user._id,
+        questionId: challenge._id,
+        feature: 'DAILY_CHALLENGE',
+        amount: plannedPoints,
+        reason: 'daily_challenge_solved',
+        referenceId: challenge._id,
+        referenceModel: 'Challenge',
+        description: `Solved Daily Challenge: ${challenge.title || challenge._id}`
+      });
+      if (xpResult.awarded) {
+        await StudentProfile.findOneAndUpdate(
+          { userId: req.user._id },
+          { $inc: { 'stats.dailyChallengesCompleted': 1 } }
+        );
+      }
+    } else {
+      const curProfile = await StudentProfile.findOne({ userId: req.user._id }).select('totalXp currentLevel').lean();
+      xpResult = {
+        awarded: false,
+        alreadyCompleted: Boolean(passed && wasAlreadyCompleted),
+        xpAwarded: 0,
+        totalXp: curProfile?.totalXp ?? 0,
+        level: curProfile?.currentLevel ?? null,
+        leveledUp: false
+      };
+    }
+
+    const pointsEarned = xpResult.xpAwarded || 0;
 
     const history = await ChallengeHistory.findOneAndUpdate(
       { studentId: req.user._id, challengeId },
@@ -456,14 +513,18 @@ exports.submitDomainDailyChallenge = async (req, res) => {
       { new: true }
     );
 
-    if (passed && pointsEarned > 0) {
-      await StudentProfile.findOneAndUpdate(
-        { userId: req.user._id },
-        { $inc: { totalXp: pointsEarned, 'stats.dailyChallengesCompleted': 1 } }
-      );
-    }
-
-    return res.json({ success: true, passed, score, pointsEarned, history });
+    return res.json({
+      success: true,
+      passed,
+      score,
+      pointsEarned,
+      xpAwarded: pointsEarned,
+      alreadyCompleted: Boolean(xpResult.alreadyCompleted),
+      totalXp: xpResult.totalXp ?? 0,
+      level: xpResult.level ?? null,
+      levelInfo: xpResult,
+      history
+    });
   } catch (err) {
     console.error('submitDomainDailyChallenge error:', err);
     return res.status(500).json({ success: false, message: err.message });

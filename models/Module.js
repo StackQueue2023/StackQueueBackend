@@ -31,6 +31,10 @@ const moduleSchema = new mongoose.Schema({
     type: String,
     trim: true
   }],
+  topicsSignature: {
+    type: String,
+    default: ''
+  },
   isPublished: {
     type: Boolean,
     default: true

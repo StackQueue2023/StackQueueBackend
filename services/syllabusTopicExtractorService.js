@@ -1,6 +1,7 @@
 const Module = require('../models/Module');
 const Course = require('../models/Course');
 const DomainTask = require('../models/DomainTask');
+const { computeModuleSignature, classifyConceptCategories } = require('./moduleScopeEngine');
 
 /**
  * Filter out footer noise, addresses, page counters, and table headers
@@ -10,7 +11,7 @@ function isNoiseTopic(str) {
   const s = str.trim().toLowerCase();
   if (s.length < 2) return true;
   if (/^(?:s\.?no|sl\.?no|#|no\.?|serial no)/i.test(s)) return true;
-  if (/\b(?:calicut|sankari|kondalampatti|salem|first floor|bus stop|opp\.)\b/i.test(s)) return true;
+  if (/\b(?:stack\s*queue|comprehensive\s+module|calicut|sankari|kondalampatti|salem|first floor|bus stop|opp\.)\b/i.test(s)) return true;
   if (/^\d+\s*of\s*\d+\s*--?$/i.test(s) || /^--\s*\d+\s*of\s*\d+\s*--$/i.test(s)) return true;
   if (/^page\s*\d+/i.test(s)) return true;
   if (/^\d+\s*(?:hrs?|hours?|mins?|minutes?)$/i.test(s)) return true;
@@ -24,7 +25,7 @@ function isNoiseTopic(str) {
 function cleanTopicName(raw) {
   if (!raw) return '';
   return raw
-    .replace(/^[-•*\d.]+\s*/, '')
+    .replace(/^(?:[-•*]|\d+[.)])\s*/, '')
     .replace(/\b\d+\s*(?:hrs?|hours?|h|mins?|minutes?)\b/gi, '')
     .replace(/^[-–—:\s|]+|[-–—:\s|]+$/g, '')
     .replace(/\s+/g, ' ')
@@ -143,42 +144,94 @@ async function extractCourseSyllabusTopics(courseId) {
   else if (dKey.includes('selenium') || dKey.includes('test')) domainKey = 'selenium';
   else if (dKey.includes('java')) domainKey = 'java';
 
-  const modules = await Module.find({
-    $or: [{ courseId: course._id }, { domain: domainKey }]
+  let modules = await Module.find({
+    courseId: course._id,
+    isPublished: { $ne: false }
   }).sort({ order: 1 });
+
+  if (!modules || modules.length === 0) {
+    modules = await Module.find({
+      domain: domainKey,
+      isPublished: { $ne: false }
+    }).sort({ order: 1 });
+  }
 
   const result = [];
 
   for (const mod of modules) {
     let topics = [];
 
-    // 1. Check if canonical mapping exists for this domain & module order
-    if (CANONICAL_MODULE_TOPICS[domainKey] && CANONICAL_MODULE_TOPICS[domainKey][mod.order]) {
-      topics = CANONICAL_MODULE_TOPICS[domainKey][mod.order];
-    } else if (Array.isArray(mod.topics) && mod.topics.length > 0) {
+    // 1. Always preserve the actual stored syllabus topics from DB first (never overwrite by order!)
+    if (Array.isArray(mod.topics) && mod.topics.length > 0) {
       topics = mod.topics.filter(t => !isNoiseTopic(t)).map(cleanTopicName).filter(Boolean);
+
+      // Guard against topics poisoned by legacy order-based canonical mapping
+      const titleCats = classifyConceptCategories(mod.title || '');
+      const topicsCats = classifyConceptCategories(topics.join(' '));
+      if (titleCats.length > 0 && topicsCats.length > 0) {
+        const hasOverlap = titleCats.some(c => topicsCats.includes(c));
+        if (!hasOverlap) {
+          topics = [];
+        }
+      }
+
+      // Also detect exact legacy CANONICAL_MODULE_TOPICS[domainKey][mod.order] stamps that don't match mod.title
+      if (topics.length > 0) {
+        const legacyCanonical = CANONICAL_MODULE_TOPICS[domainKey]?.[mod.order];
+        if (Array.isArray(legacyCanonical) && legacyCanonical.length > 0) {
+          const legacySet = new Set(legacyCanonical.map(t => t.toLowerCase()));
+          const matchesLegacyCount = topics.filter(t => legacySet.has(t.toLowerCase())).length;
+          if (matchesLegacyCount >= 2 && !/^module\s+\d+$/i.test((mod.title || '').trim())) {
+            const stopWords = new Set(['introduction', 'basic', 'basics', 'complete', 'create', 'learn', 'python', 'java', 'selenium', 'javascript', 'working', 'with', 'using', 'part', 'concept', 'concepts', 'operations', 'handling', 'management', 'framework', 'tutorial', 'project', 'until', 'completed', 'special', 'add', 'ons']);
+            const titleWords = String(mod.title || '')
+              .toLowerCase()
+              .replace(/[^a-z0-9\s]/g, ' ')
+              .split(/\s+/)
+              .filter(w => w.length >= 3 && !stopWords.has(w));
+            const joinedTopics = topics.join(' ').toLowerCase();
+            if (titleWords.length > 0 && !titleWords.some(w => joinedTopics.includes(w))) {
+              topics = [];
+            }
+          }
+        }
+      }
     }
 
-    // 2. If still empty, derive clean subtopics from module title
+    // 2. If empty or only contains the bare module title, derive clean subtopics from module title & description
     if (!topics || topics.length === 0) {
       const cleanModTitle = cleanTopicName(mod.title);
-      topics = [
-        `${cleanModTitle} Fundamentals & Core Syntax`,
-        `${cleanModTitle} Operations & Method Architecture`,
-        `${cleanModTitle} Practical Application & Best Practices`
-      ];
+      const rawDesc = (mod.description || '').trim();
+      const descParts = rawDesc && !rawDesc.startsWith('Comprehensive module')
+        ? rawDesc.split(/[,;&|]+/).map(cleanTopicName).filter(t => t && !isNoiseTopic(t) && t.length > 3)
+        : [];
+
+      const titleParts = cleanModTitle.split(/[,&]+|\band\b/i).map(cleanTopicName).filter(t => t && t.length > 2);
+      const combined = Array.from(new Set([...titleParts, ...descParts]));
+
+      if (combined.length >= 2) {
+        topics = combined;
+      } else {
+        topics = [
+          `${cleanModTitle} — Core Concepts`,
+          `${cleanModTitle} — Syntax & Implementation`,
+          `${cleanModTitle} — Practical Applications`
+        ];
+      }
     }
 
-    // Ensure module has clean topics saved
+    // Ensure module has clean topics and signature saved
     mod.topics = topics;
-    mod.domain = domainKey;
+    mod.domain = (course.slug || domainKey).toLowerCase();
     if (!mod.courseId) mod.courseId = course._id;
+    mod.topicsSignature = computeModuleSignature(mod);
     await mod.save();
 
     result.push({
       moduleId: mod._id,
       moduleOrder: mod.order,
       moduleTitle: mod.title,
+      moduleDescription: mod.description || '',
+      topicsSignature: mod.topicsSignature,
       topics
     });
   }

@@ -1,6 +1,5 @@
 const StudentProfile = require('../models/StudentProfile');
 const Course = require('../models/Course');
-const Game = require('../models/Game');
 const Progress = require('../models/Progress');
 const StudentBadge = require('../models/StudentBadge');
 const Badge = require('../models/Badge');
@@ -61,12 +60,6 @@ exports.getDashboard = async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(5);
 
-    // Total completed games count
-    const completedGamesCount = await Progress.countDocuments({
-      studentId: studentUserId,
-      isCompleted: true
-    });
-
     return res.json({
       success: true,
       data: {
@@ -76,8 +69,7 @@ exports.getDashboard = async (req, res) => {
         activeProject,
         todayAttendance: todayAttendance ? todayAttendance.status : 'Not Marked',
         recentFeedback,
-        recentXp,
-        completedGamesCount
+        recentXp
       }
     });
   } catch (error) {
@@ -97,15 +89,6 @@ exports.getProgress = async (req, res) => {
     const requestedDomain = req.query.domain;
     const requestedCourseId = req.query.courseId;
 
-    const DOMAIN_GAME_SLUGS = {
-      java: ['java-quest', 'dsa-battle', 'sql-detective', 'git-battle', 'cloud-mission', 'fullstack-challenge'],
-      python: ['python-island', 'dsa-battle', 'sql-detective', 'git-battle', 'cloud-mission', 'fullstack-challenge'],
-      cpp: ['dsa-battle', 'sql-detective', 'git-battle', 'cloud-mission', 'fullstack-challenge'],
-      react: ['react-lab', 'javascript-reactor', 'html-builder', 'css-arena', 'dsa-battle', 'sql-detective', 'git-battle', 'cloud-mission', 'fullstack-challenge'],
-      javascript: ['javascript-reactor', 'react-lab', 'html-builder', 'css-arena', 'dsa-battle', 'sql-detective', 'git-battle', 'cloud-mission', 'fullstack-challenge'],
-      js: ['javascript-reactor', 'react-lab', 'html-builder', 'css-arena', 'dsa-battle', 'sql-detective', 'git-battle', 'cloud-mission', 'fullstack-challenge']
-    };
-
     let activeDomain = profile?.domain || 'java';
     let activeCourse = profile?.enrolledCourseId;
     let isCompletedCourse = false;
@@ -123,31 +106,6 @@ exports.getProgress = async (req, res) => {
         isCompletedCourse = true;
       }
     }
-
-    const allowedSlugs = DOMAIN_GAME_SLUGS[(activeDomain || 'java').toLowerCase()] || DOMAIN_GAME_SLUGS.java;
-
-    const allGames = await Game.find({ slug: { $in: allowedSlugs }, isActive: true }).sort({ order: 1 });
-    const progressList = await Progress.find({ studentId: studentUserId });
-
-    const gameProgressMap = {};
-    progressList.forEach(p => {
-      gameProgressMap[p.gameSlug] = p;
-    });
-
-    const gamesProgress = allGames.map(game => {
-      const p = gameProgressMap[game.slug];
-      return {
-        gameId: game._id,
-        title: game.title,
-        slug: game.slug,
-        category: game.category,
-        totalLevels: game.totalLevels,
-        unlockedLevel: p ? p.unlockedLevel : 1,
-        completedChallengesCount: p ? p.completedChallenges.length : 0,
-        totalStars: p ? p.totalStars : 0,
-        isCompleted: p ? p.isCompleted : false
-      };
-    });
 
     // Build available courses list for selector
     const availableCourses = [];
@@ -177,8 +135,7 @@ exports.getProgress = async (req, res) => {
         availableCourses,
         stats: profile ? profile.stats : {},
         strongTopics: profile ? profile.strongTopics : [],
-        weakTopics: profile ? profile.weakTopics : [],
-        gamesProgress
+        weakTopics: profile ? profile.weakTopics : []
       }
     });
   } catch (error) {
