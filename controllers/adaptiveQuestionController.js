@@ -17,9 +17,13 @@ const InterviewTestCase = require('../models/InterviewTestCase');
 const AdaptiveQuestionSubmission = require('../models/AdaptiveQuestionSubmission');
 const StudentProfile = require('../models/StudentProfile');
 const User = require('../models/User');
+const CourseEnvironmentConfig = require('../models/CourseEnvironmentConfig');
+const WorkspaceState = require('../models/WorkspaceState');
 const { getCourseCompilerEnvironment } = require('../utils/compilerEnvironmentDetector');
 const { awardQuestionXpIdempotent } = require('../services/xpEngine');
 const { evaluateCode } = require('../services/interviewCodeRunner');
+const { evaluatePracticalWorkspace } = require('../services/practicalValidationEngine');
+const { evaluateNonCodingQuestion, runAccuracyTestBattery } = require('../services/nonCodingEvaluationEngine');
 const { generateAdaptiveQuestionsForCourse } = require('../services/adaptiveQuestionGeneratorService');
 const { allocateQuestionNumbers } = require('../services/questionNumberAllocator');
 
@@ -38,16 +42,31 @@ exports.getCurrentQuestionForCourse = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Course not found' });
     }
 
+    const courseEnvConfig = await CourseEnvironmentConfig.findOne({ courseId }).lean();
     const env = getCourseCompilerEnvironment(course);
+    if (courseEnvConfig) {
+      env.classification = courseEnvConfig.classification;
+      env.environmentType = courseEnvConfig.environmentType;
+      env.environmentName = courseEnvConfig.environmentName;
+      env.compilerLanguage = courseEnvConfig.compilerLanguage || env.language;
+      env.supportedLanguages = courseEnvConfig.supportedLanguages || [env.language];
+      env.workspaceTools = courseEnvConfig.workspaceTools || [];
+      env.validationStrategy = courseEnvConfig.validationStrategy;
+    }
 
-    // 1. Fetch all active questions for this course matching the required adaptive format
-    // When compiler is available -> fetch coding questions.
-    // When no compiler is available -> fetch MCQs.
-    let questions = await InterviewQuestion.find({
+    // 1. Fetch all active questions for this course
+    let queryFilter = {
       courseId,
-      questionType: env.format,
       isActive: { $ne: false }
-    })
+    };
+
+    if (courseEnvConfig?.classification === 'non-coding') {
+      queryFilter.questionType = { $in: ['practical', 'mcq'] };
+    } else if (courseEnvConfig?.classification === 'coding') {
+      queryFilter.questionType = { $in: ['coding', 'mcq'] };
+    }
+
+    let questions = await InterviewQuestion.find(queryFilter)
       .sort({ questionNumber: 1, _id: 1 })
       .lean();
 
@@ -56,7 +75,6 @@ exports.getCurrentQuestionForCourse = async (req, res) => {
       await generateAdaptiveQuestionsForCourse(courseId, { force: true });
       questions = await InterviewQuestion.find({
         courseId,
-        questionType: env.format,
         isActive: { $ne: false }
       })
         .sort({ questionNumber: 1, _id: 1 })
@@ -116,7 +134,9 @@ exports.getCurrentQuestionForCourse = async (req, res) => {
       points: rawQ.points || rawQ.xp || 10,
       topic: rawQ.topic || course.title,
       domain: rawQ.domain || course.domain,
-      environment: env
+      environment: env,
+      environmentType: rawQ.environmentType || courseEnvConfig?.environmentType || env.environmentType || 'frontend_web',
+      classification: courseEnvConfig?.classification || 'hybrid'
     };
 
     if (safeQuestion.questionType === 'mcq') {
@@ -125,6 +145,42 @@ exports.getCurrentQuestionForCourse = async (req, res) => {
         optionId: opt.optionId,
         text: opt.text
       }));
+    } else if (safeQuestion.questionType === 'practical') {
+      safeQuestion.rubric = rawQ.rubric || {};
+      safeQuestion.environmentType = rawQ.environmentType || courseEnvConfig?.environmentType || 'generic';
+      safeQuestion.workspaceTools = courseEnvConfig?.workspaceTools || [];
+
+      // Auto-fetch saved workspace state for continuous persistence
+      const savedState = await WorkspaceState.findOne({
+        userId: studentUserId,
+        courseId,
+        questionId: rawQ._id
+      }).lean();
+      safeQuestion.savedWorkspaceState = savedState?.stateData || null;
+      safeQuestion.lastExecutionResult = savedState?.lastExecutionResult || null;
+    } else if (['descriptive', 'scenario', 'conceptual', 'objective', 'subjective_rubric'].includes(safeQuestion.questionType)) {
+      // Non-Coding Evaluation Details (without leaking expected answers or anti-concepts)
+      safeQuestion.evaluationMethod = rawQ.evaluationMethod || rawQ.questionType;
+      safeQuestion.maxMarks = rawQ.maxMarks || rawQ.points || 10;
+      safeQuestion.passingThreshold = rawQ.passingThreshold || 70;
+      safeQuestion.reviewMode = rawQ.reviewMode || 'automatic';
+      safeQuestion.evaluationRubric = (rawQ.evaluationRubric && rawQ.evaluationRubric.length > 0)
+        ? rawQ.evaluationRubric.map(r => ({
+            criterion: r.criterion,
+            maxScore: r.maxScore,
+            description: r.description
+          }))
+        : [];
+
+      // Auto-fetch saved text answer or previous attempt
+      const savedState = await WorkspaceState.findOne({
+        userId: studentUserId,
+        courseId,
+        questionId: rawQ._id
+      }).lean();
+      safeQuestion.savedAnswer = savedState?.stateData?.submittedAnswer || '';
+      safeQuestion.savedScenario = savedState?.stateData?.scenarioResponse || null;
+      safeQuestion.lastExecutionResult = savedState?.lastExecutionResult || null;
     } else {
       // Coding Question Details
       safeQuestion.inputFormat = rawQ.inputFormat || '';
@@ -132,8 +188,18 @@ exports.getCurrentQuestionForCourse = async (req, res) => {
       safeQuestion.constraints = rawQ.constraints || '';
       safeQuestion.examples = rawQ.examples || [];
       safeQuestion.starterCode = rawQ.starterCode || {};
-      safeQuestion.programmingLanguage = rawQ.programmingLanguage || env.language || 'java';
+      safeQuestion.programmingLanguage = rawQ.programmingLanguage || env.compilerLanguage || env.language || 'java';
       safeQuestion.compiler = rawQ.compiler || env.compilerName;
+
+      // Auto-fetch saved code from WorkspaceState if present
+      const savedState = await WorkspaceState.findOne({
+        userId: studentUserId,
+        courseId,
+        questionId: rawQ._id
+      }).lean();
+      if (savedState?.stateData?.code) {
+        safeQuestion.savedCode = savedState.stateData.code;
+      }
     }
 
     return res.json({
@@ -389,6 +455,417 @@ exports.submitCodingSolution = async (req, res) => {
   } catch (err) {
     console.error('[submitCodingSolution] Error:', err);
     return res.status(500).json({ success: false, message: 'Server error evaluating code solution' });
+  }
+};
+
+/**
+ * ─────────────────────────────────────────────────────────────
+ * STUDENT: SUBMIT PRACTICAL WORKSPACE SOLUTION
+ * Evaluates non-coding and hybrid domain submissions
+ * (UI/UX, 3D CAD, Cloud Topology, QA Testing, RPA, Analytics, Cyber)
+ * ─────────────────────────────────────────────────────────────
+ */
+exports.submitPracticalSolution = async (req, res) => {
+  try {
+    const studentUserId = req.user._id;
+    const { courseId, questionId, environmentType, stateData } = req.body;
+
+    if (!courseId || !questionId) {
+      return res.status(400).json({ success: false, message: 'Missing courseId or questionId' });
+    }
+
+    const question = await InterviewQuestion.findById(questionId).lean();
+    if (!question) {
+      return res.status(404).json({ success: false, message: 'Question not found' });
+    }
+
+    // 1. Check if already solved
+    const existingSolved = await AdaptiveQuestionSubmission.findOne({
+      studentId: studentUserId,
+      courseId,
+      questionId,
+      isCorrect: true
+    });
+
+    if (existingSolved) {
+      return res.status(409).json({
+        success: false,
+        message: 'Practical task has already been solved and awarded points.',
+        pointsAwarded: 0
+      });
+    }
+
+    // 2. Evaluate workspace stateData using practicalValidationEngine
+    const targetEnv = environmentType || question.environmentType || 'generic';
+    const rubric = question.rubric || {};
+    const evalResult = evaluatePracticalWorkspace(targetEnv, stateData, rubric);
+
+    const isCorrect = (evalResult.passed === true);
+    const configuredPoints = Number(question.points) || Number(question.xp) || 20;
+    const pointsToAward = isCorrect ? configuredPoints : 0;
+
+    // 3. Persist workspace state & submission in DB
+    await WorkspaceState.findOneAndUpdate(
+      { userId: studentUserId, courseId, questionId },
+      {
+        userId: studentUserId,
+        courseId,
+        questionId,
+        environmentType: targetEnv,
+        stateData: stateData || {},
+        lastExecutedAt: new Date(),
+        lastExecutionResult: evalResult,
+        isCompleted: isCorrect,
+        completedAt: isCorrect ? new Date() : null
+      },
+      { upsert: true, new: true }
+    );
+
+    await AdaptiveQuestionSubmission.findOneAndUpdate(
+      { studentId: studentUserId, courseId, questionId },
+      {
+        $set: {
+          questionType: 'practical',
+          stateData,
+          evaluationResult: evalResult,
+          isCorrect,
+          pointsAwarded: pointsToAward,
+          evaluatedAt: new Date()
+        },
+        $inc: { attemptNumber: 1 }
+      },
+      { upsert: true, new: true }
+    );
+
+    let newTotalPoints = 0;
+    if (isCorrect) {
+      const xpResult = await awardQuestionXpIdempotent({
+        studentUserId,
+        questionId: question._id,
+        feature: 'ADAPTIVE_PRACTICAL',
+        amount: pointsToAward,
+        reason: 'adaptive_practical_solved',
+        description: `Completed Practical Challenge: ${question.title}`
+      });
+      newTotalPoints = xpResult.totalXp;
+    } else {
+      const profile = await StudentProfile.findOne({ userId: studentUserId }).select('totalXp').lean();
+      newTotalPoints = profile?.totalXp || 0;
+    }
+
+    return res.json({
+      success: true,
+      isCorrect,
+      score: evalResult.score,
+      maxScore: evalResult.maxScore,
+      message: evalResult.feedback,
+      checks: evalResult.checks,
+      pointsAwarded: pointsToAward,
+      totalPoints: newTotalPoints
+    });
+  } catch (err) {
+    console.error('[submitPracticalSolution] Error:', err);
+    return res.status(500).json({ success: false, message: 'Server error evaluating practical solution' });
+  }
+};
+
+/**
+ * ─────────────────────────────────────────────────────────────
+ * STUDENT: SUBMIT NON-CODING ANSWER (DESCRIPTIVE, SCENARIO, OBJECTIVE, SUBJECTIVE)
+ * Evaluates semantic understanding, concepts, factual accuracy, and rubrics
+ * ─────────────────────────────────────────────────────────────
+ */
+exports.submitNonCodingAnswer = async (req, res) => {
+  try {
+    const studentUserId = req.user._id;
+    const { courseId, questionId, submittedAnswer, scenarioResponse } = req.body;
+
+    if (!courseId || !questionId) {
+      return res.status(400).json({ success: false, message: 'Missing courseId or questionId' });
+    }
+
+    const question = await InterviewQuestion.findById(questionId).lean();
+    if (!question) {
+      return res.status(404).json({ success: false, message: 'Question not found' });
+    }
+
+    // 1. Check if already solved and points awarded
+    const existingSolved = await AdaptiveQuestionSubmission.findOne({
+      studentId: studentUserId,
+      courseId,
+      questionId,
+      evaluationStatus: 'Passed'
+    });
+
+    if (existingSolved) {
+      return res.status(409).json({
+        success: false,
+        message: 'Question has already been completed and points awarded.',
+        pointsAwarded: 0
+      });
+    }
+
+    // 2. Prepare submission payload
+    const submissionPayload = scenarioResponse || submittedAnswer || '';
+
+    // 3. Evaluate using dedicated nonCodingEvaluationEngine
+    const evalResult = evaluateNonCodingQuestion(submissionPayload, question);
+
+    const isPassed = (evalResult.status === 'Passed');
+    const configuredPoints = Number(question.points) || Number(question.maxMarks) || 10;
+    const pointsToAward = isPassed ? configuredPoints : 0;
+
+    // 4. Save working state to WorkspaceState
+    await WorkspaceState.findOneAndUpdate(
+      { userId: studentUserId, courseId, questionId },
+      {
+        userId: studentUserId,
+        courseId,
+        questionId,
+        environmentType: question.environmentType || 'non_coding',
+        stateData: { submittedAnswer, scenarioResponse },
+        lastExecutedAt: new Date(),
+        lastExecutionResult: evalResult,
+        isCompleted: isPassed,
+        completedAt: isPassed ? new Date() : null
+      },
+      { upsert: true, new: true }
+    );
+
+    // 5. Record submission in AdaptiveQuestionSubmission
+    await AdaptiveQuestionSubmission.findOneAndUpdate(
+      { studentId: studentUserId, courseId, questionId },
+      {
+        $set: {
+          questionType: question.questionType || 'descriptive',
+          submittedAnswer: typeof submittedAnswer === 'string' ? submittedAnswer : '',
+          scenarioResponse: typeof scenarioResponse === 'object' ? scenarioResponse : {},
+          evaluationStatus: evalResult.status,
+          marksAwarded: evalResult.marksAwarded,
+          maxMarks: evalResult.maxMarks,
+          percentage: evalResult.percentage,
+          feedback: evalResult.feedback,
+          missingConcepts: evalResult.missingConcepts || [],
+          identifiedConcepts: evalResult.identifiedConcepts || [],
+          correctionGuidance: evalResult.correctionGuidance || '',
+          evaluationEvidence: evalResult.evaluationEvidence || {},
+          isCorrect: isPassed,
+          pointsAwarded: pointsToAward,
+          evaluatedAt: new Date(),
+          retryAllowed: !isPassed
+        },
+        $inc: { attemptNumber: 1 }
+      },
+      { upsert: true, new: true }
+    );
+
+    let newTotalPoints = 0;
+    if (isPassed) {
+      const xpResult = await awardQuestionXpIdempotent({
+        studentUserId,
+        questionId: question._id,
+        feature: 'ADAPTIVE_NON_CODING',
+        amount: pointsToAward,
+        reason: 'adaptive_non_coding_passed',
+        description: `Passed Non-Coding Assessment: ${question.title}`
+      });
+      newTotalPoints = xpResult.totalXp;
+    } else {
+      const profile = await StudentProfile.findOne({ userId: studentUserId }).select('totalXp').lean();
+      newTotalPoints = profile?.totalXp || 0;
+    }
+
+    return res.json({
+      success: true,
+      status: evalResult.status,
+      isCorrect: isPassed,
+      marksAwarded: evalResult.marksAwarded,
+      maxMarks: evalResult.maxMarks,
+      percentage: evalResult.percentage,
+      message: evalResult.feedback,
+      feedback: evalResult.feedback,
+      missingConcepts: evalResult.missingConcepts,
+      identifiedConcepts: evalResult.identifiedConcepts,
+      correctionGuidance: evalResult.correctionGuidance,
+      evaluationEvidence: evalResult.evaluationEvidence,
+      pointsAwarded: pointsToAward,
+      totalPoints: newTotalPoints,
+      retryAllowed: !isPassed
+    });
+  } catch (err) {
+    console.error('[submitNonCodingAnswer] Error:', err);
+    return res.status(500).json({ success: false, message: 'Server error evaluating non-coding answer' });
+  }
+};
+
+/**
+ * ─────────────────────────────────────────────────────────────
+ * ADMIN: RUN 6-CASE ACCURACY TEST BATTERY ON QUESTION CONFIG
+ * ─────────────────────────────────────────────────────────────
+ */
+exports.adminRunAccuracyTestBattery = async (req, res) => {
+  try {
+    const { questionId } = req.params;
+    const question = await InterviewQuestion.findById(questionId).lean();
+    if (!question) {
+      return res.status(404).json({ success: false, message: 'Question not found' });
+    }
+
+    const testResults = runAccuracyTestBattery(question);
+
+    await InterviewQuestion.findByIdAndUpdate(questionId, {
+      testBatteryResults: testResults,
+      isVerifiedForPublish: testResults.allPassed
+    });
+
+    return res.json({
+      success: true,
+      results: testResults
+    });
+  } catch (err) {
+    console.error('[adminRunAccuracyTestBattery] Error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to run accuracy test battery' });
+  }
+};
+
+/**
+ * ─────────────────────────────────────────────────────────────
+ * ADMIN: GET PENDING INSTRUCTOR REVIEWS
+ * ─────────────────────────────────────────────────────────────
+ */
+exports.adminGetPendingReviews = async (req, res) => {
+  try {
+    const pendingSubmissions = await AdaptiveQuestionSubmission.find({
+      evaluationStatus: 'Instructor Review Required'
+    })
+      .populate('studentId', 'name email rollNumber')
+      .populate('questionId', 'title questionNumber courseId rubric maxMarks expectedAnswer')
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    return res.json({
+      success: true,
+      submissions: pendingSubmissions
+    });
+  } catch (err) {
+    console.error('[adminGetPendingReviews] Error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to fetch pending reviews' });
+  }
+};
+
+/**
+ * ─────────────────────────────────────────────────────────────
+ * ADMIN: OVERRIDE INSTRUCTOR REVIEW RESULT
+ * ─────────────────────────────────────────────────────────────
+ */
+exports.adminOverrideReview = async (req, res) => {
+  try {
+    const adminUserId = req.user._id;
+    const { submissionId, overrideStatus, overrideMarks, reason } = req.body;
+
+    if (!submissionId || !overrideStatus) {
+      return res.status(400).json({ success: false, message: 'Missing submissionId or overrideStatus' });
+    }
+
+    const submission = await AdaptiveQuestionSubmission.findById(submissionId);
+    if (!submission) {
+      return res.status(404).json({ success: false, message: 'Submission not found' });
+    }
+
+    const isPassed = (overrideStatus === 'Passed');
+    const marks = Number(overrideMarks !== undefined ? overrideMarks : (isPassed ? submission.maxMarks : 0));
+
+    submission.evaluationStatus = overrideStatus;
+    submission.marksAwarded = marks;
+    submission.isCorrect = isPassed;
+    submission.pointsAwarded = isPassed ? marks : 0;
+    submission.retryAllowed = !isPassed;
+    submission.instructorReview = {
+      reviewedBy: adminUserId,
+      reviewedAt: new Date(),
+      overrideMarks: marks,
+      overrideStatus,
+      reason: reason || 'Instructor manual evaluation override'
+    };
+    await submission.save();
+
+    // If passed, award XP to student and update workspace
+    if (isPassed) {
+      await awardQuestionXpIdempotent({
+        studentUserId: submission.studentId,
+        questionId: submission.questionId,
+        feature: 'ADAPTIVE_INSTRUCTOR_OVERRIDE',
+        amount: marks,
+        reason: 'instructor_override_passed',
+        description: `Passed via Instructor Review Override: Reason: ${reason}`
+      });
+
+      await WorkspaceState.findOneAndUpdate(
+        { userId: submission.studentId, courseId: submission.courseId, questionId: submission.questionId },
+        { isCompleted: true, completedAt: new Date() }
+      );
+    }
+
+    return res.json({
+      success: true,
+      message: `Review successfully updated to ${overrideStatus}.`,
+      submission
+    });
+  } catch (err) {
+    console.error('[adminOverrideReview] Error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to override review' });
+  }
+};
+
+/**
+ * ─────────────────────────────────────────────────────────────
+ * ADMIN: UPDATE NON-CODING QUESTION EVALUATION CONFIGURATION
+ * ─────────────────────────────────────────────────────────────
+ */
+exports.adminUpdateEvaluationConfig = async (req, res) => {
+  try {
+    const { questionId } = req.params;
+    const {
+      expectedAnswer,
+      explanation,
+      mandatoryConcepts,
+      acceptedAlternatives,
+      negativeConcepts,
+      requiredOutcomes,
+      evaluationRubric,
+      maxMarks,
+      passingThreshold,
+      reviewMode,
+      evaluationMethod
+    } = req.body;
+
+    const updated = await InterviewQuestion.findByIdAndUpdate(
+      questionId,
+      {
+        expectedAnswer,
+        explanation,
+        mandatoryConcepts,
+        acceptedAlternatives,
+        negativeConcepts,
+        requiredOutcomes,
+        evaluationRubric,
+        maxMarks: Number(maxMarks) || 10,
+        passingThreshold: Number(passingThreshold) || 70,
+        reviewMode: reviewMode || 'automatic',
+        evaluationMethod: evaluationMethod || 'descriptive',
+        updatedBy: req.user._id
+      },
+      { new: true }
+    );
+
+    return res.json({
+      success: true,
+      message: 'Question evaluation configuration saved.',
+      question: updated
+    });
+  } catch (err) {
+    console.error('[adminUpdateEvaluationConfig] Error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to update evaluation configuration' });
   }
 };
 

@@ -155,9 +155,89 @@ const interviewQuestionSchema = new mongoose.Schema({
   },
   questionType: {
     type: String,
-    enum: ['coding', 'conceptual', 'scenario', 'mcq'],
+    enum: ['coding', 'conceptual', 'scenario', 'mcq', 'practical', 'descriptive', 'objective', 'subjective_rubric'],
     default: 'coding',
     index: true
+  },
+  environmentType: {
+    type: String,
+    default: '',
+    index: true
+  },
+  evaluationMethod: {
+    type: String,
+    enum: ['objective', 'descriptive', 'practical', 'scenario', 'subjective_rubric', 'compiler'],
+    default: 'objective',
+    index: true
+  },
+  expectedAnswer: {
+    type: String,
+    default: ''
+  },
+  explanation: {
+    type: String,
+    default: ''
+  },
+  mandatoryConcepts: [{
+    type: String,
+    trim: true
+  }],
+  acceptedAlternatives: [{
+    type: String,
+    trim: true
+  }],
+  negativeConcepts: [{
+    type: String,
+    trim: true
+  }],
+  requiredOutcomes: [{
+    type: String,
+    trim: true
+  }],
+  requiredWorkspaceElements: [{
+    type: String,
+    trim: true
+  }],
+  validationRules: [{
+    type: String,
+    trim: true
+  }],
+  evaluationRubric: [{
+    criterion: { type: String, required: true },
+    weight: { type: Number, default: 1 },
+    maxScore: { type: Number, default: 10 },
+    description: { type: String, default: '' },
+    requiredConcepts: [{ type: String }]
+  }],
+  maxMarks: {
+    type: Number,
+    default: 10,
+    min: 1
+  },
+  passingThreshold: {
+    type: Number,
+    default: 70, // Percentage e.g. 70%
+    min: 1,
+    max: 100
+  },
+  reviewMode: {
+    type: String,
+    enum: ['automatic', 'instructor_review', 'hybrid_uncertain'],
+    default: 'automatic',
+    index: true
+  },
+  isVerifiedForPublish: {
+    type: Boolean,
+    default: false,
+    index: true
+  },
+  testBatteryResults: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null
+  },
+  rubric: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {}
   },
   options: [{
     optionId: {

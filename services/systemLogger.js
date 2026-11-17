@@ -6,7 +6,7 @@ const ERROR_LOG_FILE = path.join(LOGS_DIR, 'error.log');
 const SYSTEM_LOG_FILE = path.join(LOGS_DIR, 'system.log');
 const CRASH_LOG_FILE = path.join(LOGS_DIR, 'crash.log');
 
-if (!fs.existsSync(LOGS_DIR)) {
+if (!process.env.VERCEL && !fs.existsSync(LOGS_DIR)) {
   try {
     fs.mkdirSync(LOGS_DIR, { recursive: true });
   } catch (e) {
@@ -26,6 +26,7 @@ function appendToBuffer(entry) {
 }
 
 function safeAppendFile(filePath, content) {
+  if (process.env.VERCEL) return; // In Vercel serverless functions, filesystem is read-only
   try {
     // Check file size, if > 20MB, archive it
     if (fs.existsSync(filePath)) {

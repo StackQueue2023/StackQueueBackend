@@ -2,6 +2,8 @@ const vm = require('vm');
 const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { runSql } = require('./sqlExecutionService');
+const { runC, runCpp } = require('./cCppRunner');
 
 // Temporary directory for sandboxed file runs
 const RUNNER_DIR = path.join(__dirname, '..', 'scratch', 'runners');
@@ -672,12 +674,18 @@ async function evaluateCode(arg1, arg2, arg3, arg4) {
     const tc = testCases[i];
     let runResult;
 
-    if (language === 'javascript' || language === 'js') {
+    if (language === 'javascript' || language === 'js' || language === 'node') {
       runResult = await runJavaScript(code, tc.input);
-    } else if (language === 'python' || language === 'py') {
+    } else if (language === 'python' || language === 'py' || language === 'python3') {
       runResult = await runPython(code, tc.input);
     } else if (language === 'java') {
       runResult = await runJava(code, tc.input);
+    } else if (language === 'c') {
+      runResult = await runC(code, tc.input);
+    } else if (language === 'cpp' || language === 'c++') {
+      runResult = await runCpp(code, tc.input);
+    } else if (language === 'sql' || language === 'sqlite' || language === 'mysql' || language === 'postgresql') {
+      runResult = await runSql(code, tc.input);
     } else {
       return {
         status: 'UNSUPPORTED_LANGUAGE',
@@ -769,5 +777,8 @@ module.exports = {
   runJavaScript,
   runPython,
   runJava,
+  runC,
+  runCpp,
+  runSql,
   normalizeOutput
 };

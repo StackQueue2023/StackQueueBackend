@@ -7,36 +7,44 @@ if (!process.env.VERCEL) {
 const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
+const mongoose = require('mongoose');
 const connectDB = require('./config/db');
 const crypto = require('crypto');
 const { captureError } = require('./services/errorAlertService');
 const systemLogger = require('./services/systemLogger');
+const {
+  requestDiagnosticsMiddleware,
+  recordCrashState,
+  getDiagnosticsSummary,
+  getLastRequest
+} = require('./services/requestDiagnosticsService');
 
 // Process-Level Exception & Rejection Handlers — Bulletproof Error Containment
 process.on('unhandledRejection', (reason, promise) => {
   const err = reason instanceof Error ? reason : new Error(String(reason));
   systemLogger.error(`[Process Unhandled Rejection]: ${err.message}`, {
     stack: err.stack,
-    type: 'unhandledRejection'
+    type: 'unhandledRejection',
+    lastRequest: getLastRequest()
   });
   captureError(err, {
     service: 'Node.js Process (Unhandled Rejection)',
     severity: 'HIGH',
-    impact: 'Asynchronous promise rejected without an error handler. Process maintained running.'
+    impact: 'Asynchronous promise rejected without an error handler. Process maintained running without exit.',
+    diagnosticDetails: { lastRequest: getLastRequest() }
   }).catch(() => {});
 });
 
 process.on('uncaughtException', async (err) => {
   systemLogger.fatal(`[Process Uncaught Exception]: ${err.message}`, {
     stack: err.stack,
-    type: 'uncaughtException'
+    type: 'uncaughtException',
+    lastRequest: getLastRequest()
   });
+
+  // Record complete crash state and dispatch immediate emergency admin email
   try {
-    await captureError(err, {
-      service: 'Node.js Process (Uncaught Exception)',
-      severity: 'CRITICAL',
-      impact: 'Fatal uncaught exception captured in process runtime.'
-    });
+    await recordCrashState(err, 'UNCAUGHT_EXCEPTION', 1);
   } catch (alertErr) {
     systemLogger.error(`[Emergency Alert Failed]: ${alertErr.message}`);
   }
@@ -103,6 +111,9 @@ app.use((req, res, next) => {
   next();
 });
 
+// Real-Time Request Lifecycle & Diagnostics Tracking Middleware
+app.use(requestDiagnosticsMiddleware);
+
 // Root endpoint to verify server status from browser / Vercel
 app.get('/', (req, res) => {
   const isVercel = !!process.env.VERCEL;
@@ -116,7 +127,8 @@ app.get('/', (req, res) => {
     timestamp: new Date().toISOString(),
     endpoints: {
       health: '/api/health',
-      monitoring: '/api/monitoring/system-health'
+      monitoring: '/api/monitoring/system-health',
+      diagnostics: '/api/monitoring/request-diagnostics'
     }
   });
 });
@@ -130,7 +142,6 @@ app.get('/api', (req, res) => {
 });
 
 // Health Check with Database Status
-const mongoose = require('mongoose');
 app.get('/api/health', (req, res) => {
   const dbStates = {
     0: 'disconnected',
@@ -149,6 +160,14 @@ app.get('/api/health', (req, res) => {
     notice: hasDbUri ? undefined : 'Please add MONGODB_URI to your Vercel Project Settings -> Environment Variables',
     timestamp: new Date().toISOString(),
     version: '1.0.0'
+  });
+});
+
+// Real-Time Request Performance & Diagnostic Flight-Recorder Endpoint
+app.get('/api/monitoring/request-diagnostics', (req, res) => {
+  res.json({
+    success: true,
+    data: getDiagnosticsSummary()
   });
 });
 
@@ -233,6 +252,7 @@ app.use('/api/monitoring', require('./routes/monitoringRoutes'));
 app.use('/api/training-management', require('./routes/trainingManagementRoutes'));
 app.use('/api/college-financial', require('./routes/collegeFinancialRoutes'));
 app.use('/api/adaptive-questions', require('./routes/adaptiveQuestionRoutes'));
+app.use('/api/workspace', require('./routes/workspaceRoutes'));
 app.use('/api', require('./routes/collegeTrainingSyllabusRoutes'));
 
 // Start schedulers (Only in persistent server / local daemon environments, never in serverless functions)

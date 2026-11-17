@@ -28,15 +28,17 @@ const createTransporter = () => {
 const transporter = createTransporter();
 
 /**
- * Verify SMTP connection configuration on module startup
+ * Verify SMTP connection configuration on module startup (Only in persistent server mode with credentials configured)
  */
-transporter.verify((error, _success) => {
-  if (error) {
-    console.error(`SMTP connection failed: ${error.message || error}`);
-  } else {
-    console.log(`[SMTP] Connection established successfully for ${APP_NAME}`);
-  }
-});
+if (!process.env.VERCEL && process.env.SMTP_PASS) {
+  transporter.verify((error, _success) => {
+    if (error) {
+      console.error(`SMTP connection failed: ${error.message || error}`);
+    } else {
+      console.log(`[SMTP] Connection established successfully for ${APP_NAME}`);
+    }
+  });
+}
 
 /**
  * Send real 6-digit Email Verification OTP via Nodemailer with STACK QUEUE Branding

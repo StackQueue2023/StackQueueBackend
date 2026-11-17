@@ -15,8 +15,8 @@ const { sanitizeString, sanitizeObject, parseStackTrace, generateRemediationHint
 const LOGS_DIR = path.join(__dirname, '..', 'logs');
 const FALLBACK_QUEUE_FILE = path.join(LOGS_DIR, 'pending_alerts.json');
 
-// Ensure logs directory exists
-if (!fs.existsSync(LOGS_DIR)) {
+// Ensure logs directory exists (skip in Vercel serverless functions)
+if (!process.env.VERCEL && !fs.existsSync(LOGS_DIR)) {
   try {
     fs.mkdirSync(LOGS_DIR, { recursive: true });
   } catch (e) {
@@ -90,6 +90,7 @@ function generateFingerprint(service, errorType, message, fileName, lineNumber) 
  * Append alert to local fallback JSON file when MongoDB is unavailable
  */
 function saveToFallbackQueue(alertData) {
+  if (process.env.VERCEL) return; // Read-only filesystem in serverless functions
   try {
     let queue = [];
     if (fs.existsSync(FALLBACK_QUEUE_FILE)) {
