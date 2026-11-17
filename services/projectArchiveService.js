@@ -1,14 +1,27 @@
-const archiverModule = require('archiver');
+let archiverModule = null;
 const path = require('path');
 const fs = require('fs');
 const { isSensitiveFile, isExcludedFile } = require('./githubService');
 
-function createZipArchive(options = {}) {
-  if (typeof archiverModule === 'function') {
-    return archiverModule('zip', options);
+async function getArchiverModule() {
+  if (!archiverModule) {
+    try {
+      archiverModule = require('archiver');
+    } catch (_) {
+      const mod = await import('archiver');
+      archiverModule = mod.default || mod;
+    }
   }
-  if (archiverModule.ZipArchive) {
-    return new archiverModule.ZipArchive(options);
+  return archiverModule;
+}
+
+async function createZipArchive(options = {}) {
+  const mod = await getArchiverModule();
+  if (typeof mod === 'function') {
+    return mod('zip', options);
+  }
+  if (mod.ZipArchive) {
+    return new mod.ZipArchive(options);
   }
   throw new Error('Unsupported archiver module format');
 }
@@ -40,7 +53,7 @@ async function streamProjectZip({
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   }
 
-  const archive = createZipArchive({
+  const archive = await createZipArchive({
     zlib: { level: 9 } // Maximum compression
   });
 
