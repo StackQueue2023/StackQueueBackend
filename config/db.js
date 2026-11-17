@@ -101,11 +101,13 @@ const connectDB = async () => {
     reconnectAttempts = 0;
     systemLogger.info(`[MongoDB] Connected successfully: ${conn.connection.host}`);
 
-    try {
-      const { deduplicateColleges } = require('../controllers/adminController');
-      await deduplicateColleges();
-    } catch (dedupErr) {
-      systemLogger.warn(`[MongoDB College Deduplication Warning]: ${dedupErr.message}`);
+    if (!process.env.VERCEL) {
+      try {
+        const { deduplicateColleges } = require('../controllers/adminController');
+        await deduplicateColleges();
+      } catch (dedupErr) {
+        systemLogger.warn(`[MongoDB College Deduplication Warning]: ${dedupErr.message}`);
+      }
     }
 
     return conn;
