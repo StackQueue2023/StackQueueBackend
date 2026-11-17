@@ -7,11 +7,15 @@ const batchManagementController = require('../controllers/batchManagementControl
 const { protect } = require('../middleware/auth');
 const { authorize } = require('../middleware/rbac');
 
-// Setup multer for PDF uploads
-const tempDir = path.join(__dirname, '../uploads/temp');
-if (!fs.existsSync(tempDir)) {
-  fs.mkdirSync(tempDir, { recursive: true });
-}
+const os = require('os');
+
+// Setup multer for PDF uploads (use /tmp in serverless environments)
+const tempDir = process.env.VERCEL ? path.join(os.tmpdir(), 'uploads_temp') : path.join(__dirname, '../uploads/temp');
+try {
+  if (!fs.existsSync(tempDir)) {
+    fs.mkdirSync(tempDir, { recursive: true });
+  }
+} catch (_) {}
 const upload = multer({ dest: tempDir });
 
 router.use(protect);

@@ -99,11 +99,14 @@ exports.generateDailyReportPDF = async (batchId, dateStr) => {
 
   const avgPointsToday = totalStudents > 0 ? Math.round(totalPointsEarnedToday / totalStudents) : 0;
 
-  // Ensure output directory exists
-  const reportsDir = path.join(__dirname, '../uploads/reports');
-  if (!fs.existsSync(reportsDir)) {
-    fs.mkdirSync(reportsDir, { recursive: true });
-  }
+  // Ensure output directory exists (use os.tmpdir in serverless)
+  const os = require('os');
+  const reportsDir = process.env.VERCEL ? path.join(os.tmpdir(), 'reports') : path.join(__dirname, '../uploads/reports');
+  try {
+    if (!fs.existsSync(reportsDir)) {
+      fs.mkdirSync(reportsDir, { recursive: true });
+    }
+  } catch (_) {}
 
   const fileName = `Batch_Report_${batch.code}_${todayStr}.pdf`;
   const pdfFilePath = path.join(reportsDir, fileName);

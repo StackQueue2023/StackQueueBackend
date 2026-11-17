@@ -7,15 +7,19 @@ const adminTutorController = require('../controllers/adminTutorController');
 const { protect } = require('../middleware/auth');
 const { authorize } = require('../middleware/rbac');
 
-// Ensure upload directories exist
-const uploadDir = path.join(__dirname, '..', 'uploads');
+const os = require('os');
+
+// Ensure upload directories exist (use os.tmpdir in serverless)
+const uploadDir = process.env.VERCEL ? path.join(os.tmpdir(), 'uploads') : path.join(__dirname, '..', 'uploads');
 const resumeDir = path.join(uploadDir, 'resumes');
 const avatarDir = path.join(uploadDir, 'avatars');
 
 [uploadDir, resumeDir, avatarDir].forEach(d => {
-  if (!fs.existsSync(d)) {
-    fs.mkdirSync(d, { recursive: true });
-  }
+  try {
+    if (!fs.existsSync(d)) {
+      fs.mkdirSync(d, { recursive: true });
+    }
+  } catch (_) {}
 });
 
 // Multer Storage Configuration

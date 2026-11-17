@@ -8,11 +8,15 @@ const {
   CollegeFinancialEmailLog
 } = require('../models/CollegeFinancialModels');
 
-// Ensure reports directory exists
-const reportsDir = path.join(__dirname, '../uploads/reports');
-if (!fs.existsSync(reportsDir)) {
-  fs.mkdirSync(reportsDir, { recursive: true });
-}
+const os = require('os');
+
+// Ensure reports directory exists (use os.tmpdir in serverless)
+const reportsDir = process.env.VERCEL ? path.join(os.tmpdir(), 'reports') : path.join(__dirname, '../uploads/reports');
+try {
+  if (!fs.existsSync(reportsDir)) {
+    fs.mkdirSync(reportsDir, { recursive: true });
+  }
+} catch (_) {}
 
 // Nodemailer transport
 function createTransporter() {

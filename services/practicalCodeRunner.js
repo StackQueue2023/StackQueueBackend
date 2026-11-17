@@ -3,11 +3,15 @@ const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
+const os = require('os');
+
 // Temporary directory for sandboxed file runs
-const RUNNER_DIR = path.join(__dirname, '..', 'scratch', 'practical_runners');
-if (!fs.existsSync(RUNNER_DIR)) {
-  fs.mkdirSync(RUNNER_DIR, { recursive: true });
-}
+const RUNNER_DIR = process.env.VERCEL ? path.join(os.tmpdir(), 'scratch_practical') : path.join(__dirname, '..', 'scratch', 'practical_runners');
+try {
+  if (!fs.existsSync(RUNNER_DIR)) {
+    fs.mkdirSync(RUNNER_DIR, { recursive: true });
+  }
+} catch (_) {}
 
 function normalize(str) {
   if (str === null || str === undefined) return '';

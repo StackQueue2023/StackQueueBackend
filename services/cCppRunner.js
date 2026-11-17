@@ -2,10 +2,14 @@ const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const RUNNER_DIR = path.join(__dirname, '..', 'scratch', 'runners');
-if (!fs.existsSync(RUNNER_DIR)) {
-  fs.mkdirSync(RUNNER_DIR, { recursive: true });
-}
+const os = require('os');
+
+const RUNNER_DIR = process.env.VERCEL ? path.join(os.tmpdir(), 'scratch_runners') : path.join(__dirname, '..', 'scratch', 'runners');
+try {
+  if (!fs.existsSync(RUNNER_DIR)) {
+    fs.mkdirSync(RUNNER_DIR, { recursive: true });
+  }
+} catch (_) {}
 
 /**
  * Checks if a native compiler binary exists on the system

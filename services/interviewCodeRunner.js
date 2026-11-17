@@ -5,11 +5,15 @@ const path = require('path');
 const { runSql } = require('./sqlExecutionService');
 const { runC, runCpp } = require('./cCppRunner');
 
+const os = require('os');
+
 // Temporary directory for sandboxed file runs
-const RUNNER_DIR = path.join(__dirname, '..', 'scratch', 'runners');
-if (!fs.existsSync(RUNNER_DIR)) {
-  fs.mkdirSync(RUNNER_DIR, { recursive: true });
-}
+const RUNNER_DIR = process.env.VERCEL ? path.join(os.tmpdir(), 'scratch_runners') : path.join(__dirname, '..', 'scratch', 'runners');
+try {
+  if (!fs.existsSync(RUNNER_DIR)) {
+    fs.mkdirSync(RUNNER_DIR, { recursive: true });
+  }
+} catch (_) {}
 
 /**
  * Normalizes output strings for robust comparison

@@ -9,11 +9,15 @@ const lifecycleCtrl = require('../controllers/projectLifecycleController');
 const { protect } = require('../middleware/auth');
 const { authorize } = require('../middleware/rbac');
 
-// Ensure upload directories exist
-const uploadDir = path.join(__dirname, '..', 'uploads', 'projects');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
+const os = require('os');
+
+// Ensure upload directories exist (use os.tmpdir in serverless)
+const uploadDir = process.env.VERCEL ? path.join(os.tmpdir(), 'uploads', 'projects') : path.join(__dirname, '..', 'uploads', 'projects');
+try {
+  if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+  }
+} catch (_) {}
 
 // Multer Storage Configuration for Projects
 const storage = multer.diskStorage({
