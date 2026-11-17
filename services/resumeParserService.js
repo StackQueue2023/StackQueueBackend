@@ -1,6 +1,9 @@
-const pdfParseModule = require('pdf-parse');
+function getPdfParse() {
+  return require('pdf-parse');
+}
 
 async function safePdfParse(pdfBuffer) {
+  const pdfParseModule = getPdfParse();
   if (typeof pdfParseModule === 'function') {
     const data = await pdfParseModule(pdfBuffer);
     return { text: data.text || '' };

@@ -1,4 +1,3 @@
-const pdfParseModule = require('pdf-parse');
 const { generateQuestionSpec } = require('./questionSpecificationEngine');
 const { analyzeModuleScope, buildTopicId } = require('./moduleScopeEngine');
 
@@ -20,6 +19,7 @@ const TECH_KEYWORDS = {
  * 1. Extract plain text from PDF buffer
  */
 async function extractTextFromPdf(buffer) {
+  const pdfParseModule = require('pdf-parse');
   try {
     if (typeof pdfParseModule === 'function') {
       const data = await pdfParseModule(buffer);
