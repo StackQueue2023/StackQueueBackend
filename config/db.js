@@ -5,6 +5,11 @@ const systemLogger = require('../services/systemLogger');
 const DEFAULT_MONGODB_URI = 'mongodb+srv://STACK_QUEUE:stack2023@stackqueuecluster.wfarxbd.mongodb.net/stackqueue_2?retryWrites=true&w=majority';
 
 let cachedConnectionPromise = null;
+let isConnecting = false;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+const BASE_RECONNECT_DELAY_MS = 3000;
+const MAX_RECONNECT_DELAY_MS = 30000;
 
 const mongoOptions = {
   maxPoolSize: process.env.VERCEL ? 10 : 50,
