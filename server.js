@@ -91,15 +91,15 @@ process.on('uncaughtException', async (err) => {
 });
 
 // Connect to MongoDB
-if (!process.env.VERCEL || process.env.MONGODB_URI) {
-  connectDB();
-}
+connectDB().catch(err => {
+  systemLogger.warn(`[Initial DB Connect Warning]: ${err.message}`);
+});
 
 const app = express();
 
 // Ensure Database Connection in Serverless / Cold-Start Environments
 app.use(async (req, res, next) => {
-  if (process.env.MONGODB_URI && mongoose.connection.readyState !== 1) {
+  if (mongoose.connection.readyState !== 1) {
     try {
       await connectDB();
     } catch (_) {}

@@ -2,20 +2,18 @@ const mongoose = require('mongoose');
 const { captureError, flushFallbackQueue } = require('../services/errorAlertService');
 const systemLogger = require('../services/systemLogger');
 
-let isConnecting = false;
-let reconnectTimer = null;
-let reconnectAttempts = 0;
-const BASE_RECONNECT_DELAY_MS = 3000;
-const MAX_RECONNECT_DELAY_MS = 30000;
+const DEFAULT_MONGODB_URI = 'mongodb+srv://STACK_QUEUE:stack2023@stackqueuecluster.wfarxbd.mongodb.net/stackqueue_2?retryWrites=true&w=majority';
+
+let cachedConnectionPromise = null;
 
 const mongoOptions = {
-  maxPoolSize: 50,
-  minPoolSize: 5,
+  maxPoolSize: process.env.VERCEL ? 10 : 50,
+  minPoolSize: process.env.VERCEL ? 1 : 5,
   maxIdleTimeMS: 30000,
-  serverSelectionTimeoutMS: 8000,
-  socketTimeoutMS: 30000,
+  serverSelectionTimeoutMS: 10000,
+  socketTimeoutMS: 45000,
   heartbeatFrequencyMS: 10000,
-  autoIndex: true
+  autoIndex: false
 };
 
 // MongoDB Connection Event Listeners
@@ -88,46 +86,48 @@ const connectDB = async () => {
   if (mongoose.connection.readyState === 1) {
     return mongoose.connection;
   }
-  if (isConnecting) {
-    return;
+
+  if (cachedConnectionPromise) {
+    return cachedConnectionPromise;
   }
 
-  isConnecting = true;
-  const uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/stackqueue_db';
+  const uri = process.env.MONGODB_URI || DEFAULT_MONGODB_URI;
 
-  try {
-    const conn = await mongoose.connect(uri, mongoOptions);
-    isConnecting = false;
-    reconnectAttempts = 0;
-    systemLogger.info(`[MongoDB] Connected successfully: ${conn.connection.host}`);
+  cachedConnectionPromise = (async () => {
+    try {
+      const conn = await mongoose.connect(uri, mongoOptions);
+      systemLogger.info(`[MongoDB] Connected successfully: ${conn.connection.host}`);
 
-    if (!process.env.VERCEL) {
-      try {
-        const { deduplicateColleges } = require('../controllers/adminController');
-        await deduplicateColleges();
-      } catch (dedupErr) {
-        systemLogger.warn(`[MongoDB College Deduplication Warning]: ${dedupErr.message}`);
+      if (!process.env.VERCEL) {
+        try {
+          const { deduplicateColleges } = require('../controllers/adminController');
+          await deduplicateColleges();
+        } catch (dedupErr) {
+          systemLogger.warn(`[MongoDB College Deduplication Warning]: ${dedupErr.message}`);
+        }
       }
+
+      return conn.connection;
+    } catch (error) {
+      cachedConnectionPromise = null;
+      systemLogger.error(`[MongoDB Connection Error]: ${error.message}`, {
+        stack: error.stack
+      });
+
+      await captureError(error, {
+        service: 'MongoDB Database Service',
+        severity: 'CRITICAL',
+        impact: 'MongoDB connection failed. Process is maintaining operation.'
+      }).catch(() => {});
+
+      if (!process.env.VERCEL) {
+        scheduleReconnect();
+      }
+      throw error;
     }
+  })();
 
-    return conn;
-  } catch (error) {
-    isConnecting = false;
-    systemLogger.error(`[MongoDB Connection Error]: ${error.message}`, {
-      stack: error.stack,
-      reconnectAttempts
-    });
-
-    // Alert admin without killing the process
-    await captureError(error, {
-      service: 'MongoDB Database Service',
-      severity: 'CRITICAL',
-      impact: 'MongoDB connection failed. Backend process is maintaining operation and retrying connection.'
-    }).catch(() => {});
-
-    // NEVER call process.exit(1). Always schedule safe retry loop.
-    scheduleReconnect();
-  }
+  return cachedConnectionPromise;
 };
 
 module.exports = connectDB;
