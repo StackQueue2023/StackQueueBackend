@@ -28,15 +28,19 @@ if (typeof global.DOMRect === 'undefined') {
 
 let app = null;
 let bootError = null;
+let mongoose = null;
+let connectDB = null;
 
 try {
   app = require('../server');
+  mongoose = require('mongoose');
+  connectDB = require('../config/db');
 } catch (err) {
   bootError = err;
   console.error('[CRITICAL BOOT ERROR In api/index.js]:', err);
 }
 
-module.exports = (req, res) => {
+module.exports = async (req, res) => {
   if (bootError) {
     console.error('[Vercel Invocation Failed Due To Boot Error]:', bootError);
     return res.status(500).json({
@@ -46,5 +50,20 @@ module.exports = (req, res) => {
       stack: bootError.stack
     });
   }
+
+  // Ensure database connection is fully established before Express processes requests
+  if (mongoose && connectDB && mongoose.connection.readyState !== 1) {
+    try {
+      await connectDB();
+    } catch (dbErr) {
+      console.error('[Vercel Cold-Start DB Connect Error]:', dbErr.message);
+      return res.status(503).json({
+        success: false,
+        message: 'Database connection is initializing. Please retry in a few moments.',
+        error: dbErr.message
+      });
+    }
+  }
+
   return app(req, res);
 };

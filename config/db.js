@@ -13,13 +13,16 @@ const MAX_RECONNECT_DELAY_MS = 30000;
 
 const mongoOptions = {
   maxPoolSize: process.env.VERCEL ? 10 : 50,
-  minPoolSize: process.env.VERCEL ? 1 : 5,
-  maxIdleTimeMS: 30000,
-  serverSelectionTimeoutMS: 10000,
+  minPoolSize: 0,
+  maxIdleTimeMS: 15000,
+  serverSelectionTimeoutMS: 8000,
   socketTimeoutMS: 45000,
   heartbeatFrequencyMS: 10000,
   autoIndex: false
 };
+
+// Disable Mongoose query buffering in serverless to prevent 10-second hangs
+mongoose.set('bufferCommands', false);
 
 // MongoDB Connection Event Listeners
 mongoose.connection.on('connected', () => {

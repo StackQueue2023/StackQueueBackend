@@ -102,7 +102,14 @@ app.use(async (req, res, next) => {
   if (mongoose.connection.readyState !== 1) {
     try {
       await connectDB();
-    } catch (_) {}
+    } catch (err) {
+      systemLogger.warn(`[DB Connection Middleware Error]: ${err.message}`);
+      return res.status(503).json({
+        success: false,
+        message: 'Database connection is in progress. Please retry in a few moments.',
+        error: err.message
+      });
+    }
   }
   next();
 });
