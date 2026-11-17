@@ -281,6 +281,7 @@ app.use('/api/training-management', require('./routes/trainingManagementRoutes')
 app.use('/api/college-financial', require('./routes/collegeFinancialRoutes'));
 app.use('/api/adaptive-questions', require('./routes/adaptiveQuestionRoutes'));
 app.use('/api/workspace', require('./routes/workspaceRoutes'));
+app.use('/api/internship', require('./routes/internshipRoutes'));
 app.use('/api', require('./routes/collegeTrainingSyllabusRoutes'));
 
 // Start schedulers (Only in persistent server / local daemon environments, never in serverless functions)

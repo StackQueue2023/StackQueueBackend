@@ -41,7 +41,7 @@ const userSchema = new mongoose.Schema({
   },
   studentType: {
     type: String,
-    enum: ['LMS', 'COLLEGE_TRAINING', 'INSTITUTE_TRAINING', 'BOTH', 'TRAINING_TEMPORARY'],
+    enum: ['LMS', 'COLLEGE_TRAINING', 'INSTITUTE_TRAINING', 'BOTH', 'TRAINING_TEMPORARY', 'INTERNSHIP'],
     default: 'LMS',
     index: true
   },
