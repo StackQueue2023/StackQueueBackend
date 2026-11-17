@@ -822,6 +822,15 @@ exports.uploadSyllabusPdf = async (req, res) => {
       });
     }
 
+    // Update Course metadata with PDF version and extraction tracking
+    if (course) {
+      course.syllabusPdfVersion = (course.syllabusPdfVersion || 0) + 1;
+      course.syllabusPdfFileName = req.file ? req.file.originalname : (course.syllabusPdfFileName || 'Syllabus_Document.pdf');
+      course.syllabusUploadedAt = new Date();
+      course.syllabusExtractionStatus = 'extracted';
+      await course.save().catch(() => {});
+    }
+
     // 4. Delegate heavy generation to resilient background job worker
     // Returns immediately (< 400ms) with unique jobId so frontend HTTP request NEVER hangs or times out!
     const job = await createAndStartSyllabusJob({
@@ -833,6 +842,11 @@ exports.uploadSyllabusPdf = async (req, res) => {
       tasksPerModule,
       isNewCourse
     });
+
+    if (course) {
+      course.syllabusGenerationJobId = job._id;
+      await course.save().catch(() => {});
+    }
 
     return res.json({
       success: true,
@@ -981,6 +995,12 @@ exports.getGenerationStatus = async (req, res) => {
         courseId: course._id,
         courseTitle: course.title,
         domain: domainKey,
+        pdfInfo: {
+          fileName: course.syllabusPdfFileName || null,
+          version: course.syllabusPdfVersion || 1,
+          uploadedAt: course.syllabusUploadedAt || null,
+          extractionStatus: course.syllabusExtractionStatus || (course.syllabusText ? 'extracted' : 'idle')
+        },
         job: latestJob || {
           status: (counts.interviewArena > 0 || counts.testingPractice > 0) ? 'completed' : 'pending',
           progress: (counts.interviewArena > 0 || counts.testingPractice > 0) ? 100 : 0,

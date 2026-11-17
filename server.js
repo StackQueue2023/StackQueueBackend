@@ -176,8 +176,8 @@ app.get('/api', (req, res) => {
   });
 });
 
-// Health Check with Database Status
-app.get('/api/health', (req, res) => {
+// Health Check with Separate Backend API and MongoDB Statuses
+const healthHandler = (req, res) => {
   const dbStates = {
     0: 'disconnected',
     1: 'connected',
@@ -185,18 +185,30 @@ app.get('/api/health', (req, res) => {
     3: 'disconnecting'
   };
   const hasDbUri = !!process.env.MONGODB_URI;
-  const dbState = hasDbUri ? (dbStates[mongoose.connection.readyState] || 'unknown') : 'MONGODB_URI not set in Vercel';
-  const isHealthy = mongoose.connection.readyState === 1;
+  const dbReadyState = mongoose.connection.readyState;
+  const dbState = hasDbUri ? (dbStates[dbReadyState] || 'unknown') : 'MONGODB_URI not configured';
+  const isDbConnected = dbReadyState === 1;
 
-  res.status(isHealthy || !process.env.VERCEL ? (isHealthy ? 200 : 503) : 200).json({
-    status: isHealthy ? 'healthy' : (hasDbUri ? 'degraded' : 'setup_required'),
-    platform: 'STACK QUEUE Institute API',
+  res.status(isDbConnected || !process.env.VERCEL ? (isDbConnected ? 200 : 503) : 200).json({
+    status: isDbConnected ? 'healthy' : (hasDbUri ? 'degraded' : 'setup_required'),
+    platform: 'STACK QUEUE Enterprise API',
+    backendApi: 'online',
     database: dbState,
-    notice: hasDbUri ? undefined : 'Please add MONGODB_URI to your Vercel Project Settings -> Environment Variables',
+    mongodb: {
+      status: isDbConnected ? 'connected' : dbState,
+      connected: isDbConnected,
+      host: mongoose.connection.host || 'offline',
+      readyState: dbReadyState,
+      databaseName: mongoose.connection.name || 'stackqueue_2'
+    },
+    uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
     version: '1.0.0'
   });
-});
+};
+
+app.get('/health', healthHandler);
+app.get('/api/health', healthHandler);
 
 // Real-Time Request Performance & Diagnostic Flight-Recorder Endpoint
 app.get('/api/monitoring/request-diagnostics', (req, res) => {

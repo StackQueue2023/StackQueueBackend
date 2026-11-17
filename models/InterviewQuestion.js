@@ -231,6 +231,17 @@ const interviewQuestionSchema = new mongoose.Schema({
     default: false,
     index: true
   },
+  pdfVersion: {
+    type: Number,
+    default: 1,
+    index: true
+  },
+  generationStatus: {
+    type: String,
+    enum: ['pending_review', 'approved', 'published', 'flagged'],
+    default: 'pending_review',
+    index: true
+  },
   testBatteryResults: {
     type: mongoose.Schema.Types.Mixed,
     default: null

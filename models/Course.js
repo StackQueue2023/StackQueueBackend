@@ -140,6 +140,43 @@ const courseSchema = new mongoose.Schema({
   syllabusText: {
     type: String,
     default: ''
+  },
+  syllabusPdfUrl: {
+    type: String,
+    default: ''
+  },
+  syllabusPdfFileName: {
+    type: String,
+    default: ''
+  },
+  syllabusPdfVersion: {
+    type: Number,
+    default: 1
+  },
+  syllabusUploadedAt: {
+    type: Date,
+    default: null
+  },
+  syllabusExtractionStatus: {
+    type: String,
+    enum: ['idle', 'extracting', 'extracted', 'failed'],
+    default: 'idle'
+  },
+  syllabusGenerationJobId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'SyllabusGenerationJob',
+    default: null
+  },
+  syllabusQuestionStats: {
+    total: { type: Number, default: 0 },
+    easy: { type: Number, default: 0 },
+    medium: { type: Number, default: 0 },
+    hard: { type: Number, default: 0 },
+    arena: { type: Number, default: 0 },
+    mock: { type: Number, default: 0 },
+    module: { type: Number, default: 0 },
+    published: { type: Number, default: 0 },
+    pendingReview: { type: Number, default: 0 }
   }
 }, { timestamps: true });
 
