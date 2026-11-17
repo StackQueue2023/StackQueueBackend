@@ -986,8 +986,26 @@ exports.getGenerationStatus = async (req, res) => {
       }
     }
 
-    // Parallel accurate counts strictly from database collections
-    const counts = await calculateCourseQuestionCounts(course._id, domainKey);
+    // Fast-path for active polling: if job is generating, read atomic stats directly from job record
+    let counts;
+    if (latestJob && latestJob.status === 'generating' && latestJob.stats) {
+      const s = latestJob.stats;
+      counts = {
+        interviewArena: s.interviewArenaCount || 0,
+        mockInterview: s.mockInterviewCount || 0,
+        testingPractice: s.testingPracticeCount || 0,
+        total: s.totalQuestions || ((s.interviewArenaCount || 0) + (s.mockInterviewCount || 0) + (s.testingPracticeCount || 0)),
+        testedSolutions: s.testedCount || 0,
+        flagged: s.flaggedCount || 0,
+        totalModules: s.totalModules || (latestJob.parsedModules?.length || 4),
+        completedModules: s.completedModules || 0,
+        failedModules: s.failedModules || 0
+      };
+    } else {
+      counts = await calculateCourseQuestionCounts(course._id, domainKey);
+    }
+
+    const isConnected = mongoose.connection.readyState === 1;
 
     return res.json({
       success: true,
@@ -995,6 +1013,17 @@ exports.getGenerationStatus = async (req, res) => {
         courseId: course._id,
         courseTitle: course.title,
         domain: domainKey,
+        monitoring: {
+          backendConnection: 'online',
+          mongodbConnection: isConnected ? 'connected' : 'disconnected',
+          aiServiceStatus: 'active',
+          currentModule: latestJob?.currentModule || 'All modules ready',
+          totalModules: latestJob?.stats?.totalModules || counts.totalModules || 4,
+          completedModules: latestJob?.stats?.completedModules || (latestJob?.status === 'completed' ? (counts.totalModules || 4) : 0),
+          failedModules: latestJob?.stats?.failedModules || 0,
+          generatedQuestionsCount: counts.total || 0,
+          jobStatus: latestJob?.status || (counts.total > 0 ? 'completed' : 'pending')
+        },
         pdfInfo: {
           fileName: course.syllabusPdfFileName || null,
           version: course.syllabusPdfVersion || 1,

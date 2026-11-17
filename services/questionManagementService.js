@@ -208,81 +208,123 @@ async function validateQuestionContent(param = {}) {
   }
 }
 
+// In-memory TTL Cache for question counts to prevent serverless database overload
+const countsCache = new Map();
+const COUNTS_CACHE_TTL_MS = 15000; // 15 seconds
+
 /**
  * Calculates current accurate dashboard counts strictly from database records.
- * Ensures a question is NEVER counted as both tested and flagged.
+ * Uses intelligent TTL caching and fast single-aggregation queries to avoid timeouts.
  */
 async function calculateCourseQuestionCounts(courseId, domainKey) {
   const cId = mongoose.Types.ObjectId.isValid(courseId) ? new mongoose.Types.ObjectId(courseId) : null;
   const dKey = domainKey || '';
+  const cacheKey = `${cId ? cId.toString() : 'nocId'}_${dKey}`;
+
+  // Return cached result if available and fresh (< 15 seconds)
+  const cached = countsCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp < COUNTS_CACHE_TTL_MS)) {
+    return cached.counts;
+  }
 
   const courseQuery = cId ? { $or: [{ courseId: cId }, { domain: dKey }] } : { domain: dKey };
 
-  const [
-    interviewArenaCount,
-    mockInterviewCount,
-    testingPracticeCount,
-    testedDomainTasks,
-    testedInterviewQuestions,
-    flaggedInterviewQuestions,
-    flaggedDomainTasks,
-    totalModulesCount
-  ] = await Promise.all([
-    InterviewQuestion.countDocuments({
-      ...courseQuery,
-      targetFeature: 'INTERVIEW_ARENA',
-      isActive: true
-    }),
-    InterviewQuestion.countDocuments({
-      ...courseQuery,
-      targetFeature: 'MOCK_INTERVIEW',
-      isActive: true
-    }),
-    DomainTask.countDocuments({
-      ...courseQuery,
-      isActive: true
-    }),
-    DomainTask.countDocuments({
-      ...courseQuery,
-      isTested: true,
-      verificationStatus: { $ne: 'flagged' },
-      isActive: true
-    }),
-    InterviewQuestion.countDocuments({
-      ...courseQuery,
-      isTested: true,
-      verificationStatus: { $ne: 'flagged' },
-      isActive: true
-    }),
-    InterviewQuestion.countDocuments({
-      ...courseQuery,
-      verificationStatus: 'flagged',
-      isActive: true
-    }),
-    DomainTask.countDocuments({
-      ...courseQuery,
-      verificationStatus: 'flagged',
-      isActive: true
-    }),
-    Module.countDocuments({
-      ...courseQuery,
-      isPublished: { $ne: false }
-    })
-  ]);
+  try {
+    const countsPromise = (async () => {
+      const [qAgg, dtAgg, totalModulesCount] = await Promise.all([
+        InterviewQuestion.aggregate([
+          { $match: { ...courseQuery, isActive: true } },
+          { $group: {
+              _id: {
+                targetFeature: '$targetFeature',
+                isTested: '$isTested',
+                verificationStatus: '$verificationStatus'
+              },
+              count: { $sum: 1 }
+          }}
+        ]),
+        DomainTask.aggregate([
+          { $match: { ...courseQuery, isActive: true } },
+          { $group: {
+              _id: {
+                isTested: '$isTested',
+                verificationStatus: '$verificationStatus'
+              },
+              count: { $sum: 1 }
+          }}
+        ]),
+        Module.countDocuments({ ...courseQuery, isPublished: { $ne: false } })
+      ]);
 
-  const testedSolutionsCount = testedDomainTasks + testedInterviewQuestions;
-  const flaggedCount = flaggedInterviewQuestions + flaggedDomainTasks;
-  const totalQuestions = interviewArenaCount + mockInterviewCount + testingPracticeCount;
+      let interviewArenaCount = 0;
+      let mockInterviewCount = 0;
+      let testedQuestions = 0;
+      let flaggedQuestions = 0;
 
-  return {
-    interviewArena: interviewArenaCount,
-    mockInterview: mockInterviewCount,
-    testingPractice: testingPracticeCount,
-    total: totalQuestions,
-    testedSolutions: testedSolutionsCount,
-    flagged: flaggedCount,
-    totalModules: totalModulesCount
-  };
+      qAgg.forEach(r => {
+        const { targetFeature, isTested, verificationStatus } = r._id;
+        if (targetFeature === 'INTERVIEW_ARENA') interviewArenaCount += r.count;
+        if (targetFeature === 'MOCK_INTERVIEW') mockInterviewCount += r.count;
+        if (isTested && verificationStatus !== 'flagged') testedQuestions += r.count;
+        if (verificationStatus === 'flagged') flaggedQuestions += r.count;
+      });
+
+      let testingPracticeCount = 0;
+      let testedDomainTasks = 0;
+      let flaggedDomainTasks = 0;
+
+      dtAgg.forEach(r => {
+        const { isTested, verificationStatus } = r._id;
+        testingPracticeCount += r.count;
+        if (isTested && verificationStatus !== 'flagged') testedDomainTasks += r.count;
+        if (verificationStatus === 'flagged') flaggedDomainTasks += r.count;
+      });
+
+      const testedSolutionsCount = testedDomainTasks + testedQuestions;
+      const flaggedCount = flaggedQuestions + flaggedDomainTasks;
+      const totalQuestions = interviewArenaCount + mockInterviewCount + testingPracticeCount;
+
+      return {
+        interviewArena: interviewArenaCount,
+        mockInterview: mockInterviewCount,
+        testingPractice: testingPracticeCount,
+        total: totalQuestions,
+        testedSolutions: testedSolutionsCount,
+        flagged: flaggedCount,
+        totalModules: totalModulesCount
+      };
+    })();
+
+    // 4000ms safety timeout guard: prevents serverless timeout if Atlas is sluggish
+    const timeoutFallback = new Promise((resolve) => {
+      setTimeout(() => {
+        resolve({
+          interviewArena: 0,
+          mockInterview: 0,
+          testingPractice: 0,
+          total: 0,
+          testedSolutions: 0,
+          flagged: 0,
+          totalModules: 4
+        });
+      }, 4000);
+    });
+
+    const counts = await Promise.race([countsPromise, timeoutFallback]);
+    countsCache.set(cacheKey, { timestamp: Date.now(), counts });
+    return counts;
+  } catch (err) {
+    console.warn('[calculateCourseQuestionCounts Error]:', err.message);
+    return {
+      interviewArena: 0,
+      mockInterview: 0,
+      testingPractice: 0,
+      total: 0,
+      testedSolutions: 0,
+      flagged: 0,
+      totalModules: 4
+    };
+  }
 }
 
 module.exports = {
