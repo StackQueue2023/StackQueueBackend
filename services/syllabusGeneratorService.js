@@ -15,28 +15,106 @@ const TECH_KEYWORDS = {
   react: ['JSX', 'Components', 'Props', 'useState', 'useEffect', 'Custom Hooks', 'Context API', 'Redux', 'Tailwind', 'Routing', 'Formik', 'API Integration']
 };
 
+const zlib = require('zlib');
+
+/**
+ * Native Node.js fallback PDF text stream extraction using built-in zlib.
+ * Decompresses FlateDecode streams and extracts standard PDF text tokens.
+ */
+function extractRawPdfTextFallback(buffer) {
+  if (!buffer || !Buffer.isBuffer(buffer)) return '';
+  const content = buffer.toString('binary');
+  const streamRegex = /stream[\r\n]+([\s\S]*?)[\r\n]+endstream/g;
+  let match;
+  let extracted = '';
+
+  while ((match = streamRegex.exec(content)) !== null) {
+    const rawStream = Buffer.from(match[1], 'binary');
+    let decompressed = '';
+    try {
+      decompressed = zlib.inflateSync(rawStream).toString('utf-8');
+    } catch {
+      decompressed = match[1];
+    }
+
+    const textMatches = decompressed.match(/\(([^)]+)\)\s*Tj/g);
+    if (textMatches) {
+      textMatches.forEach(m => {
+        const t = m.replace(/^\(/, '').replace(/\)\s*Tj$/, '').replace(/\\([()\\])/g, '$1');
+        if (t.trim()) extracted += t + ' ';
+      });
+      extracted += '\n';
+    }
+
+    const arrayMatches = decompressed.match(/\[([^\]]+)\]\s*TJ/g);
+    if (arrayMatches) {
+      arrayMatches.forEach(m => {
+        const inner = m.match(/\(([^)]+)\)/g);
+        if (inner) {
+          extracted += inner.map(s => s.replace(/^\(/, '').replace(/\)$/, '').replace(/\\([()\\])/g, '$1')).join('') + ' ';
+        }
+      });
+      extracted += '\n';
+    }
+  }
+  return extracted.trim();
+}
+
 /**
  * 1. Extract plain text from PDF buffer
+ * Resilient multi-strategy engine with pure native fallback for serverless Lambda environments.
  */
 async function extractTextFromPdf(buffer) {
-  const pdfParseModule = require('pdf-parse');
+  let pdfParseModule = null;
   try {
-    if (typeof pdfParseModule === 'function') {
-      const data = await pdfParseModule(buffer);
-      return data.text || '';
-    } else if (pdfParseModule && pdfParseModule.PDFParse) {
-      const parser = new pdfParseModule.PDFParse({ data: buffer });
-      const result = await parser.getText();
-      return result.text || '';
-    } else if (pdfParseModule && typeof pdfParseModule.default === 'function') {
-      const data = await pdfParseModule.default(buffer);
-      return data.text || '';
-    }
-    throw new Error('Unsupported pdf-parse module export format');
-  } catch (err) {
-    console.error('Error parsing PDF buffer:', err);
-    throw new Error('Failed to parse PDF document. Please ensure the file is a valid PDF.');
+    pdfParseModule = require('pdf-parse');
+  } catch (modErr) {
+    console.warn('[pdf-parse load warning]:', modErr.message);
   }
+
+  // Strategy 1: Modern pdf-parse class constructor (v2+)
+  if (pdfParseModule && pdfParseModule.PDFParse) {
+    try {
+      const parser = new pdfParseModule.PDFParse({ data: buffer });
+      const res = await parser.getText();
+      const txt = (res && res.text) ? res.text : (typeof res === 'string' ? res : '');
+      if (txt && txt.trim()) return txt;
+    } catch (e1) {
+      console.warn('[PDFParse Class Strategy Note]:', e1.message);
+    }
+  }
+
+  // Strategy 2: Direct function invocation (v1)
+  if (typeof pdfParseModule === 'function') {
+    try {
+      const data = await pdfParseModule(buffer);
+      if (data && data.text && data.text.trim()) return data.text;
+    } catch (e2) {
+      console.warn('[pdfParse Function Strategy Note]:', e2.message);
+    }
+  }
+
+  // Strategy 3: Default export function
+  if (pdfParseModule && typeof pdfParseModule.default === 'function') {
+    try {
+      const data = await pdfParseModule.default(buffer);
+      if (data && data.text && data.text.trim()) return data.text;
+    } catch (e3) {
+      console.warn('[pdfParse.default Strategy Note]:', e3.message);
+    }
+  }
+
+  // Strategy 4: Native Node.js built-in stream decompression fallback (Guaranteed serverless safe)
+  try {
+    const fallbackText = extractRawPdfTextFallback(buffer);
+    if (fallbackText && fallbackText.trim()) {
+      return fallbackText;
+    }
+  } catch (fbErr) {
+    console.warn('[PDF Native Fallback Note]:', fbErr.message);
+  }
+
+  throw new Error('Unable to extract text from the provided PDF file. Please ensure it contains readable text.');
 }
 
 /**

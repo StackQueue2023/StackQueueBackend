@@ -122,7 +122,7 @@ const interviewQuestionSchema = new mongoose.Schema({
   },
   evaluationMethod: {
     type: String,
-    enum: ['coding', 'preview', 'query', 'scenario', 'conceptual'],
+    enum: ['coding', 'preview', 'query', 'scenario', 'conceptual', 'objective', 'descriptive', 'practical', 'subjective_rubric', 'compiler'],
     default: 'coding',
     index: true
   },
@@ -162,12 +162,6 @@ const interviewQuestionSchema = new mongoose.Schema({
   environmentType: {
     type: String,
     default: '',
-    index: true
-  },
-  evaluationMethod: {
-    type: String,
-    enum: ['objective', 'descriptive', 'practical', 'scenario', 'subjective_rubric', 'compiler'],
-    default: 'objective',
     index: true
   },
   expectedAnswer: {

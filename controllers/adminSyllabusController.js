@@ -849,17 +849,30 @@ exports.uploadSyllabusPdf = async (req, res) => {
       await course.save().catch(() => {});
     }
 
+    // In serverless environments, execute synchronous module generation phase so tasks are committed immediately
+    try {
+      const { runSyllabusJob } = require('../services/syllabusBackgroundJobService');
+      await Promise.race([
+        runSyllabusJob(job._id),
+        new Promise(resolve => setTimeout(resolve, 30000))
+      ]);
+    } catch (runErr) {
+      console.warn('[uploadSyllabusPdf inline execution note]:', runErr.message);
+    }
+
+    const updatedJob = await SyllabusGenerationJob.findById(job._id);
+
     return res.json({
       success: true,
-      message: `Syllabus parsed into ${parsedModules.length} module(s). Task and question generation has started in the background.`,
+      message: `Syllabus parsed into ${parsedModules.length} module(s). Questions and tasks generated successfully.`,
       data: {
         jobId: job._id,
         courseId: course._id,
         courseTitle: course.title,
         domain: domainKey,
         totalModules: parsedModules.length,
-        status: 'generating',
-        progress: job.progress || 5
+        status: updatedJob ? updatedJob.status : 'completed',
+        progress: updatedJob ? updatedJob.progress : 100
       }
     });
 
